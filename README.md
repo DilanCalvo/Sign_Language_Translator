@@ -11,8 +11,6 @@ so you can try it immediately — and you can also capture your own signs and
 retrain it to make it yours.
 
 > **Tech:** Python · MediaPipe · TensorFlow/Keras · OpenCV · scikit-learn
-> **Team:** Dilan Calvo, Adrián Durán, Nazareth Solís — COTEPECOS, Web
-> Development, 2026.
 
 ![Sign Language Translator detecting the letter A in real time](assets/screenshot.png)
 
