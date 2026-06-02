@@ -1,0 +1,14 @@
+# Normalize line endings: store text as LF in the repo, check out native.
+* text=auto
+
+# Explicit text files
+*.py    text
+*.md    text
+*.txt   text
+*.json  text
+*.csv   text
+
+# Binary assets — never touch line endings
+*.h5    binary
+*.task  binary
+*.png   binary
