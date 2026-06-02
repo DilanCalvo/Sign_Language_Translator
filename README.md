@@ -14,6 +14,11 @@ retrain it to make it yours.
 > **Team:** Dilan Calvo, Adrián Durán, Nazareth Solís — COTEPECOS, Web
 > Development, 2026.
 
+![Sign Language Translator detecting the letter A in real time](assets/screenshot.png)
+
+*Live detection: MediaPipe draws the 21 hand landmarks, the model predicts the
+letter, and a confidence bar confirms it.*
+
 ---
 
 ## How it works

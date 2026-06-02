@@ -34,7 +34,7 @@ Sections:
 # Change this value to switch modes until a keyboard shortcut is exposed in
 # the UI.
 
-MODE = "words"
+MODE = "letters"
 
 
 # ================================================================
