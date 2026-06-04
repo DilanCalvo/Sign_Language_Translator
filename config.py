@@ -34,7 +34,7 @@ Sections:
 # Change this value to switch modes until a keyboard shortcut is exposed in
 # the UI.
 
-MODE = "letters"
+MODE = "words"
 
 
 # ================================================================
@@ -209,6 +209,19 @@ WORD_COOLDOWN_FRAMES = 45
 
 MOTION_LETTERS = {"J", "Z"}
 
+# Minimum frames between letter additions to the overlay buffer.
+#
+# Once a letter is accepted into the subtitle strip, no new letter (even a
+# different one) is accepted until this many frames pass. This prevents a
+# single held pose from spamming the buffer.
+#
+#   Raise → slower accumulation; good if letters pile up too fast.
+#   Lower → faster accumulation; may repeat the same letter.
+#
+# Default: 20 frames ~= 0.67s at 30fps.
+
+LETTER_COOLDOWN_FRAMES = 20
+
 
 # ================================================================
 #  5. CAPTURE — parameters used when recording new word samples
@@ -292,3 +305,166 @@ DETECTOR_MIN_PRESENCE_CONFIDENCE = 0.70
 # Default: 0.50.
 
 DETECTOR_MIN_TRACKING_CONFIDENCE = 0.50
+
+
+# ================================================================
+#  8. OUTPUT — voice and subtitle overlay
+# ================================================================
+
+# Master switch for speech synthesis.
+#
+# Set to False to run silently (overlay still works). Useful when running
+# in a noisy environment or while debugging predictions.
+
+VOICE_ENABLED = True
+
+
+# ================================================================
+#  9. SPEECH INPUT — voice-to-text (hearing person → deaf person)
+# ================================================================
+
+# Master switch for speech-to-text input.
+#
+# When True, SpeechInput loads a Whisper model at startup and the user can
+# toggle the microphone with the P key. Set to False to disable the feature
+# entirely (no microphone access, no Whisper model loaded).
+
+SPEECH_INPUT_ENABLED = True
+
+# Whisper model size. Trades accuracy for speed and disk space.
+#
+# The model is downloaded once to ~/.cache/huggingface/hub/ on first run.
+#
+#   "tiny"  (~77 MB)  — fastest; good for clear speech in quiet rooms
+#   "base"  (~148 MB) — better accuracy; recommended for noisier environments
+#   "small" (~488 MB) — high accuracy; ~3-5s latency on CPU without GPU
+#
+# "tiny" is the right default for demos and classroom use.
+
+SPEECH_WHISPER_MODEL = "tiny"
+
+# Whisper language hint.
+#
+# None = auto-detect language each clip (~0.2s overhead per transcription).
+# Set to "es" for Spanish, "en" for English, etc., to skip detection and
+# improve accuracy when the language is always known in advance.
+
+SPEECH_LANGUAGE = None
+
+
+# ================================================================
+#  10. GRAMMAR — verb conjugation for Spanish context
+# ================================================================
+
+# Verb conjugation tables (base form → person/number → conjugated form).
+#
+# Structure:
+#   "infinitive": {
+#       "1p_sg": "yo form",        (1st person singular)
+#       "2p_sg": "tú form",        (2nd person singular)
+#       "3p_sg": "él/ella form",   (3rd person singular)
+#       "1p_pl": "nosotros form",  (1st person plural)
+#       "2p_pl": "vosotros form",  (2nd person plural — rarely used in LAX)
+#       "3p_pl": "ellos form",     (3rd person plural)
+#   }
+#
+# Used by src/grammar.py to conjugate verbs based on the previous pronoun.
+# Easily expanded as vocabulary grows. If a verb is missing, it is left
+# unconjugated (safe fallback).
+
+VERB_CONJUGATIONS = {
+    "ser": {
+        "1p_sg": "soy",
+        "2p_sg": "eres",
+        "3p_sg": "es",
+        "1p_pl": "somos",
+        "2p_pl": "sois",
+        "3p_pl": "son",
+    },
+    "creer": {
+        "1p_sg": "creo",
+        "2p_sg": "crees",
+        "3p_sg": "cree",
+        "1p_pl": "creemos",
+        "2p_pl": "creéis",
+        "3p_pl": "creen",
+    },
+    "pensar": {
+        "1p_sg": "pienso",
+        "2p_sg": "piensas",
+        "3p_sg": "piensa",
+        "1p_pl": "pensamos",
+        "2p_pl": "pensáis",
+        "3p_pl": "piensan",
+    },
+    "querer": {
+        "1p_sg": "quiero",
+        "2p_sg": "quieres",
+        "3p_sg": "quiere",
+        "1p_pl": "queremos",
+        "2p_pl": "queréis",
+        "3p_pl": "quieren",
+    },
+    "poder": {
+        "1p_sg": "puedo",
+        "2p_sg": "puedes",
+        "3p_sg": "puede",
+        "1p_pl": "podemos",
+        "2p_pl": "podéis",
+        "3p_pl": "pueden",
+    },
+    "tener": {
+        "1p_sg": "tengo",
+        "2p_sg": "tienes",
+        "3p_sg": "tiene",
+        "1p_pl": "tenemos",
+        "2p_pl": "tenéis",
+        "3p_pl": "tienen",
+    },
+    "hacer": {
+        "1p_sg": "hago",
+        "2p_sg": "haces",
+        "3p_sg": "hace",
+        "1p_pl": "hacemos",
+        "2p_pl": "hacéis",
+        "3p_pl": "hacen",
+    },
+    "ir": {
+        "1p_sg": "voy",
+        "2p_sg": "vas",
+        "3p_sg": "va",
+        "1p_pl": "vamos",
+        "2p_pl": "vais",
+        "3p_pl": "van",
+    },
+}
+
+# Pronoun-to-grammatical-form mapping.
+#
+# Maps pronouns detected in text to their grammatical form, used to look up
+# conjugation in VERB_CONJUGATIONS above. Case-insensitive matching.
+
+PRONOUN_TO_FORM = {
+    "yo": "1p_sg",
+    "i": "1p_sg",  # English (for potential bilingual future)
+    "tú": "2p_sg",
+    "tu": "2p_sg",  # Without accent (ASL user might not sign it clearly)
+    "you": "2p_sg",  # English
+    "él": "3p_sg",
+    "she": "3p_sg",  # English (feminine)
+    "ella": "3p_sg",
+    "usted": "3p_sg",
+    "ud": "3p_sg",
+    "he": "3p_sg",  # English (masculine)
+    "nosotros": "1p_pl",
+    "nosotras": "1p_pl",
+    "we": "1p_pl",  # English
+    "vosotros": "2p_pl",
+    "vosotras": "2p_pl",
+    "you_all": "2p_pl",
+    "ellos": "3p_pl",
+    "ellas": "3p_pl",
+    "they": "3p_pl",  # English
+    "ustedes": "3p_pl",
+    "uds": "3p_pl",
+}

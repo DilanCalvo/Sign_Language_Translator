@@ -1,0 +1,92 @@
+{
+  "verbs": {
+    "ser": {
+      "1p_sg": "soy",
+      "2p_sg": "eres",
+      "3p_sg": "es",
+      "1p_pl": "somos",
+      "2p_pl": "sois",
+      "3p_pl": "son"
+    },
+    "creer": {
+      "1p_sg": "creo",
+      "2p_sg": "crees",
+      "3p_sg": "cree",
+      "1p_pl": "creemos",
+      "2p_pl": "creéis",
+      "3p_pl": "creen"
+    },
+    "pensar": {
+      "1p_sg": "pienso",
+      "2p_sg": "piensas",
+      "3p_sg": "piensa",
+      "1p_pl": "pensamos",
+      "2p_pl": "pensáis",
+      "3p_pl": "piensan"
+    },
+    "querer": {
+      "1p_sg": "quiero",
+      "2p_sg": "quieres",
+      "3p_sg": "quiere",
+      "1p_pl": "queremos",
+      "2p_pl": "queréis",
+      "3p_pl": "quieren"
+    },
+    "poder": {
+      "1p_sg": "puedo",
+      "2p_sg": "puedes",
+      "3p_sg": "puede",
+      "1p_pl": "podemos",
+      "2p_pl": "podéis",
+      "3p_pl": "pueden"
+    },
+    "tener": {
+      "1p_sg": "tengo",
+      "2p_sg": "tienes",
+      "3p_sg": "tiene",
+      "1p_pl": "tenemos",
+      "2p_pl": "tenéis",
+      "3p_pl": "tienen"
+    },
+    "hacer": {
+      "1p_sg": "hago",
+      "2p_sg": "haces",
+      "3p_sg": "hace",
+      "1p_pl": "hacemos",
+      "2p_pl": "hacéis",
+      "3p_pl": "hacen"
+    },
+    "ir": {
+      "1p_sg": "voy",
+      "2p_sg": "vas",
+      "3p_sg": "va",
+      "1p_pl": "vamos",
+      "2p_pl": "vais",
+      "3p_pl": "van"
+    }
+  },
+  "pronouns": {
+    "yo": "1p_sg",
+    "i": "1p_sg",
+    "tú": "2p_sg",
+    "tu": "2p_sg",
+    "you": "2p_sg",
+    "él": "3p_sg",
+    "she": "3p_sg",
+    "ella": "3p_sg",
+    "usted": "3p_sg",
+    "ud": "3p_sg",
+    "he": "3p_sg",
+    "nosotros": "1p_pl",
+    "nosotras": "1p_pl",
+    "we": "1p_pl",
+    "vosotros": "2p_pl",
+    "vosotras": "2p_pl",
+    "you_all": "2p_pl",
+    "ellos": "3p_pl",
+    "ellas": "3p_pl",
+    "they": "3p_pl",
+    "ustedes": "3p_pl",
+    "uds": "3p_pl"
+  }
+}
