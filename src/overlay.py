@@ -11,8 +11,8 @@ It also automatically conjugates verbs based on the preceding pronoun context.
 import cv2
 import numpy as np
 
-from config import LETTER_COOLDOWN_FRAMES
-from src.grammar import conjugate_verb, is_pronoun
+from config import LETTER_COOLDOWN_FRAMES, DEFAULT_TENSE
+from src.grammar import conjugate_verb, is_pronoun, detect_tense
 
 _MAX_VISIBLE_CHARS = 50
 
@@ -116,17 +116,27 @@ class LetterBuffer:
         # Defer conjugation to display time (see _conjugate_for_display).
         return first_letter
 
-    def _conjugate_for_display(self, text: str) -> str:
+    def _conjugate_for_display(self, text: str, override_tense: str | None = None) -> str:
         """
-        Apply conjugation to the displayed text based on pronoun context.
+        Apply conjugation to the displayed text based on pronoun context and tense.
 
         This processes the full accumulated text and conjugates verbs that
-        follow pronouns. It is called just before display, ensuring we have
-        complete words to work with.
+        follow pronouns, applying the appropriate tense. It is called just
+        before display, ensuring we have complete words to work with.
+
+        Args:
+            text: accumulated text to conjugate
+            override_tense: if provided, use this tense instead of auto-detecting
         """
         words = text.split()
         if len(words) < 2:
             return text
+
+        # Detect tense: either from override or auto-detect from text
+        if override_tense:
+            tense = override_tense.lower()
+        else:
+            tense = detect_tense(text)
 
         conjugated_words = []
         for i, word in enumerate(words):
@@ -135,26 +145,38 @@ class LetterBuffer:
             else:
                 prev_word = words[i - 1]
                 if is_pronoun(prev_word):
-                    # Conjugate: convert word to lowercase, conjugate, then uppercase
-                    conjugated = conjugate_verb(word.lower(), prev_word).upper()
+                    # Conjugate: convert word to lowercase, conjugate with tense, then uppercase
+                    conjugated = conjugate_verb(word.lower(), prev_word, tense=tense).upper()
                     conjugated_words.append(conjugated)
                 else:
                     conjugated_words.append(word)
 
         return " ".join(conjugated_words)
 
-    def get_text(self) -> str:
-        """Return the accumulated text (last _MAX_VISIBLE_CHARS characters)."""
+    def get_text(self, override_tense: str | None = None) -> str:
+        """
+        Return the accumulated text (last _MAX_VISIBLE_CHARS characters).
+
+        Args:
+            override_tense: if provided, force this tense instead of auto-detecting.
+                          Useful for manual tense selection (e.g., user presses 'T' for past).
+        """
         raw_text = "".join(self._chars[-_MAX_VISIBLE_CHARS:])
-        return self._conjugate_for_display(raw_text)
+        return self._conjugate_for_display(raw_text, override_tense=override_tense)
 
     def clear(self) -> None:
         self._chars.clear()
         self._cooldown = 0
 
-    def draw_subtitle(self, frame) -> None:
-        """Draw a semi-transparent subtitle bar at the bottom of the frame."""
-        text = self.get_text()
+    def draw_subtitle(self, frame, override_tense: str | None = None) -> None:
+        """
+        Draw a semi-transparent subtitle bar at the bottom of the frame.
+
+        Args:
+            frame: video frame to draw on
+            override_tense: if provided, use this tense instead of auto-detecting
+        """
+        text = self.get_text(override_tense=override_tense)
         if not text:
             return
 

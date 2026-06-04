@@ -1,55 +1,90 @@
 #!/usr/bin/env python3
 """
-Integration test: simulate real letter-by-letter input and verify conjugation.
+Integration test: simulate real letter-by-letter input with tense support.
 
 This test mimics the actual flow:
 1. User spells a pronoun letter by letter
 2. User presses space
 3. User spells a verb letter by letter
-4. System conjugates automatically
+4. System conjugates automatically with correct tense (present, past, or future)
 """
 
 from src.overlay import LetterBuffer
 
-def test_conjugation_flow():
-    """Simulate real user input."""
+def test_conjugation_with_tenses():
+    """Test conjugation across all tenses."""
     buffer = LetterBuffer()
 
     test_cases = [
+        # Present tense (default)
         {
-            "name": "yo creo (1st person singular)",
+            "name": "PRESENT: yo creo",
             "sequence": "Y O space C R E E R",
-            "expected": "yo creo",
+            "tense": "present",
+            "expected": "YO CREO",
         },
         {
-            "name": "ellos creen (3rd person plural)",
+            "name": "PRESENT: ellos creen",
             "sequence": "E L L O S space C R E E R",
-            "expected": "ellos creen",
+            "tense": "present",
+            "expected": "ELLOS CREEN",
+        },
+        # Past tense
+        {
+            "name": "PAST: yo creí",
+            "sequence": "Y O space C R E E R",
+            "tense": "past",
+            "expected": "YO CREÍ",
         },
         {
-            "name": "nosotros creemos (1st person plural)",
-            "sequence": "N O S O T R O S space C R E E R",
-            "expected": "nosotros creemos",
+            "name": "PAST: ellos creyeron",
+            "sequence": "E L L O S space C R E E R",
+            "tense": "past",
+            "expected": "ELLOS CREYERON",
+        },
+        # Future tense
+        {
+            "name": "FUTURE: yo creeré",
+            "sequence": "Y O space C R E E R",
+            "tense": "future",
+            "expected": "YO CREERÉ",
         },
         {
-            "name": "tu crees (2nd person singular, without accent)",
-            "sequence": "T U space C R E E R",
-            "expected": "TU CREES",
+            "name": "FUTURE: ellos creerán",
+            "sequence": "E L L O S space C R E E R",
+            "tense": "future",
+            "expected": "ELLOS CREERÁN",
         },
+        # Irregular verbs
         {
-            "name": "yo soy (irregular verb)",
+            "name": "SER present: yo soy",
             "sequence": "Y O space S E R",
-            "expected": "yo soy",
+            "tense": "present",
+            "expected": "YO SOY",
         },
         {
-            "name": "Chained: yo puedo ellos pueden",
-            "sequence": "Y O space P O D E R space E L L O S space P O D E R",
-            "expected": "yo puedo ellos pueden",
+            "name": "SER past: yo fui",
+            "sequence": "Y O space S E R",
+            "tense": "past",
+            "expected": "YO FUI",
+        },
+        {
+            "name": "SER future: yo seré",
+            "sequence": "Y O space S E R",
+            "tense": "future",
+            "expected": "YO SERÉ",
+        },
+        # Chained verbs
+        {
+            "name": "Chained PAST: ayer yo creí ellos creyeron",
+            "sequence": "A Y E R space Y O space C R E E R space E L L O S space C R E E R",
+            "tense": None,  # Auto-detect from "ayer"
+            "expected": "AYER YO CREÍ ELLOS CREYERON",
         },
     ]
 
-    print("Integration Tests: Letter-by-letter conjugation")
-    print("=" * 60)
+    print("Integration Tests: Conjugation with Tense Support")
+    print("=" * 70)
 
     passed = 0
     failed = 0
@@ -58,22 +93,20 @@ def test_conjugation_flow():
         buffer.clear()
         name = test_case["name"]
         sequence = test_case["sequence"].split()
+        tense = test_case.get("tense")
         expected = test_case["expected"]
 
         # Simulate letter-by-letter input with cooldown frames.
-        # Each call to update() with None decrements cooldown;
-        # when cooldown reaches 0, the next letter is accepted.
         for letter in sequence:
             if letter == "space":
-                # Keep calling with None until space is accepted
                 while not buffer.update("space"):
-                    buffer.update(None)  # decrement cooldown
+                    buffer.update(None)
             else:
-                # Keep calling with None until letter is accepted
                 while not buffer.update(letter):
-                    buffer.update(None)  # decrement cooldown
+                    buffer.update(None)
 
-        result = buffer.get_text()
+        # Get text with explicit tense or auto-detect
+        result = buffer.get_text(override_tense=tense)
 
         # Compare (case-insensitive for display)
         matches = result.lower() == expected.lower()
@@ -90,7 +123,7 @@ def test_conjugation_flow():
 
         print()
 
-    print("=" * 60)
+    print("=" * 70)
     print(f"Results: {passed} passed, {failed} failed")
 
     if failed == 0:
@@ -102,5 +135,5 @@ def test_conjugation_flow():
 
 
 if __name__ == "__main__":
-    success = test_conjugation_flow()
+    success = test_conjugation_with_tenses()
     exit(0 if success else 1)
