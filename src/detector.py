@@ -74,7 +74,6 @@ class Detector:
 
         landmarks_data = self._extract_landmarks(result)
         self._draw_landmarks(frame, result)
-        self._draw_hud(frame, landmarks_data)
 
         return frame, landmarks_data
 

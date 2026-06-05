@@ -49,7 +49,7 @@ from src.utils import normalize_landmarks
 # -------------------------------------------------------------------
 
 WORDS = [
-    "adios",
+    "yo",
 ]
 
 TARGET_PER_WORD  = _CFG_TARGET      # sequences to capture per word

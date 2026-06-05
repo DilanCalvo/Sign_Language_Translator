@@ -9,15 +9,20 @@ Input contract (dict from detector.py):
 
 Output contract:
     {
-        "prediction":      str|None,   # best letter (None if confidence < threshold)
-        "confidence":      float,      # letter confidence (0-1)
-        "model_used":      str|None,   # "one_hand" | None
-        "runner_up":       dict|None,  # {"prediction": str, "confidence": float} or None
+        "prediction":      str|None,   # committed top-1 (None if conf < threshold)
+        "confidence":      float,      # real top-1 confidence (0-1), even if not committed
+        "model_used":      str|None,   # "one_hand" | "numbers" | None
+        "top3":            list,       # [{"prediction": str, "confidence": float}] x<=3, best first
         "word_prediction": dict|None,  # {"prediction": str, "confidence": float} or None
         "hand_is_signing": bool,       # True while the hand moves enough for a word
     }
 
-runner_up: second letter candidate when its confidence >= 15%.
+prediction vs top3: `prediction` is the committed guess (None below threshold,
+used to drive the subtitle buffer and voice). `top3` is ALWAYS the raw ranked
+candidates regardless of threshold, so the HUD can show alternatives when the
+model is unsure (confidence < LOW_CONFIDENCE_THRESHOLD). This separates "what
+we act on" from "what hints we surface".
+
 word_prediction: dynamic-sign prediction. It is None when:
   - the word model is not loaded,
   - the buffer does not yet hold WORD_SEQ_FRAMES frames,
@@ -36,14 +41,18 @@ import tensorflow as tf
 from config import (
     MODEL_ONE_HAND_PATH   as _MODEL_ONE,
     MODEL_WORDS_PATH      as _MODEL_WORDS,
+    MODEL_NUMBERS_PATH    as _MODEL_NUMBERS,
     LABELS_ONE_HAND_PATH  as _LABELS_ONE,
     LABELS_WORDS_PATH     as _LABELS_WORDS,
+    LABELS_NUMBERS_PATH   as _LABELS_NUMBERS,
     WORD_SEQ_FRAMES       as _SEQ_FRAMES,
     WORD_MOTION_WINDOW    as _MOTION_WINDOW,
     WORD_NULL_LABEL       as _NULL_WORD_LABEL,
-    LETTER_CONFIDENCE_THRESHOLD as CONFIDENCE_THRESHOLD,
+    LETTER_CONFIDENCE_THRESHOLD as _LETTER_THRESHOLD,
+    NUMBER_CONFIDENCE_THRESHOLD as _NUMBER_THRESHOLD,
     WORD_CONFIDENCE_THRESHOLD,
     WORD_MIN_MOTION_STD   as _MIN_MOTION_STD,
+    ALT_MIN_CONFIDENCE    as _ALT_MIN_CONFIDENCE,
 )
 from src.utils import normalize_landmarks
 
@@ -79,6 +88,22 @@ class Classifier:
                 self._model_words  = tf.keras.models.load_model(_MODEL_WORDS, compile=False)
                 self._labels_words = labels_candidate
 
+        # The numbers model is optional and shares the letter pipeline (single
+        # frame, 63 values). It stays None until the team trains 0-9; the app
+        # then shows a clear notice in numbers mode instead of faking letters.
+        self._model_numbers  = None
+        self._labels_numbers = None
+        if os.path.isfile(_MODEL_NUMBERS) and os.path.isfile(_LABELS_NUMBERS):
+            labels_candidate = self._load_labels(_LABELS_NUMBERS)
+            if len(labels_candidate) < 2:
+                print(
+                    f"  [WARN] The numbers model only has {len(labels_candidate)} class. "
+                    "At least 2 are needed; ignoring it."
+                )
+            else:
+                self._model_numbers  = tf.keras.models.load_model(_MODEL_NUMBERS, compile=False)
+                self._labels_numbers = labels_candidate
+
         # Motion level of the last analyzed frame (updated by _run_words).
         # Exposed in the classify() result as "hand_is_signing".
         self._last_motion = 0.0
@@ -87,15 +112,31 @@ class Classifier:
         # it here with zeros so the first real frame is instant.
         self._warmup()
 
-        n_one   = len(self._labels_one)
-        n_words = len(self._labels_words) if self._labels_words else 0
-        print(f"Classifier ready  |  letters: {n_one}  |  words: {n_words}")
+        n_one     = len(self._labels_one)
+        n_words   = len(self._labels_words) if self._labels_words else 0
+        n_numbers = len(self._labels_numbers) if self._labels_numbers else 0
+        print(f"Classifier ready  |  letters: {n_one}  |  words: {n_words}  |  numbers: {n_numbers}")
+
+    @property
+    def has_words(self) -> bool:
+        return self._model_words is not None
+
+    @property
+    def has_numbers(self) -> bool:
+        return self._model_numbers is not None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def classify(self, landmarks_data):
+    def classify(self, landmarks_data, static_mode="letters"):
+        """
+        Classify one frame.
+
+        static_mode selects which single-frame model produces the static
+        prediction: "letters" (default) or "numbers". The word model runs
+        regardless, since it also drives the "hand_is_signing" motion gate.
+        """
         num_hands = landmarks_data["num_hands"]
         h1 = landmarks_data["landmarks_hand1"]
 
@@ -108,8 +149,20 @@ class Classifier:
         # _last_motion is updated internally in _run_words().
         word_pred = self._update_word_buffer(h1)
 
-        # Letter classification (always uses the primary hand).
-        result = self._run(self._model_one, self._labels_one, h1, "one_hand")
+        # Static classification with the model selected by the active mode.
+        if static_mode == "numbers":
+            if self._model_numbers is not None:
+                result = self._run(self._model_numbers, self._labels_numbers,
+                                   h1, "numbers", _NUMBER_THRESHOLD)
+            else:
+                # Numbers mode requested but no model trained yet. Be honest:
+                # produce an empty static result so the HUD can show a notice
+                # rather than misleadingly showing letters.
+                result = {"prediction": None, "confidence": 0.0,
+                          "model_used": None, "top3": []}
+        else:
+            result = self._run(self._model_one, self._labels_one,
+                               h1, "one_hand", _LETTER_THRESHOLD)
 
         result["word_prediction"] = word_pred
         # True only if the word model is loaded AND the hand moves enough.
@@ -121,7 +174,7 @@ class Classifier:
     # Internals
     # ------------------------------------------------------------------
 
-    def _run(self, model, labels, flat, model_name):
+    def _run(self, model, labels, flat, model_name, threshold):
         normalized = normalize_landmarks(flat)
         tensor = tf.constant([normalized], dtype=tf.float32)
 
@@ -129,27 +182,25 @@ class Classifier:
         # for single samples in real time.
         probs = model(tensor, training=False).numpy()[0]
 
-        # Top-2 indices sorted from highest to lowest probability.
-        top2  = np.argsort(probs)[-2:][::-1]
-        idx   = int(top2[0])
-        idx2  = int(top2[1])
+        # Ranked candidates, best first. We keep up to the top 3 (filtering out
+        # near-zero noise) so the HUD can show alternatives when unsure.
+        order = np.argsort(probs)[::-1]
+        top3  = [
+            {"prediction": labels[int(i)], "confidence": float(probs[int(i)])}
+            for i in order[:3]
+            if float(probs[int(i)]) >= _ALT_MIN_CONFIDENCE
+        ]
 
-        confidence  = float(probs[idx])
-        confidence2 = float(probs[idx2])
-
-        if confidence < CONFIDENCE_THRESHOLD:
-            return self._empty()
-
-        runner_up = (
-            {"prediction": labels[idx2], "confidence": confidence2}
-            if confidence2 >= 0.15 else None
-        )
+        top1_conf = float(probs[int(order[0])])
+        # `prediction` is only committed above the acceptance threshold; the
+        # raw ranking in top3 is returned regardless of confidence.
+        accepted  = top1_conf >= threshold
 
         return {
-            "prediction": labels[idx],
-            "confidence": confidence,
+            "prediction": labels[int(order[0])] if accepted else None,
+            "confidence": top1_conf,
             "model_used": model_name,
-            "runner_up":  runner_up,
+            "top3":       top3,
         }
 
     def _update_word_buffer(self, h1_flat):
@@ -199,6 +250,8 @@ class Classifier:
         self._model_one(tf.zeros((1, 63), dtype=tf.float32), training=False)
         if self._model_words is not None:
             self._model_words(tf.zeros((1, 126), dtype=tf.float32), training=False)
+        if self._model_numbers is not None:
+            self._model_numbers(tf.zeros((1, 63), dtype=tf.float32), training=False)
 
     @staticmethod
     def _load_labels(path):
@@ -213,7 +266,7 @@ class Classifier:
             "prediction":      None,
             "confidence":      0.0,
             "model_used":      None,
-            "runner_up":       None,
+            "top3":            [],
             "word_prediction": None,
             "hand_is_signing": False,
         }

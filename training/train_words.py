@@ -43,6 +43,8 @@ DATA_CSVS = [
     "data/real_capture/words/words_20260601_200315_adios--2.csv",
     "data/real_capture/words/words_20260520_222047_nada.csv",
     "data/real_capture/words/words_20260521_213259_yo.csv",
+    "data/real_capture/words/words_20260603_211840_yo--2.csv",
+    "data/real_capture/words/words_20260603_211413_pensar.csv",
 ]
 
 MODEL_OUT  = "model/model_words.h5"
@@ -62,6 +64,19 @@ _MIRROR_MASK_126 = tf.constant(
 )
 
 
+def _normalize_label(label: str) -> str:
+    """
+    Canonicalize a class label.
+
+    Labels are case-insensitive by convention (all lowercase), so different
+    captures of the same sign always land in one class. This merges accidental
+    duplicates like "Yo" and "yo" into a single "yo" class — splitting them
+    would halve the samples and let the softmax divide probability between two
+    neurons for the same gesture.
+    """
+    return str(label).strip().lower()
+
+
 def _load_data(csvs) -> tuple[np.ndarray, np.ndarray]:
     paths = [csvs] if isinstance(csvs, str) else csvs
     frames = []
@@ -75,7 +90,7 @@ def _load_data(csvs) -> tuple[np.ndarray, np.ndarray]:
         print("[ERROR] No CSV found. Check DATA_CSVS.")
         raise SystemExit(1)
     df = pd.concat(frames, ignore_index=True)
-    labels = np.array(df["label"].tolist())
+    labels = np.array([_normalize_label(l) for l in df["label"].tolist()])
     X = df.drop(columns=["label"]).to_numpy(dtype=np.float32)
     return X, labels
 

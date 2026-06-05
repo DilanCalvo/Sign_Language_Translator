@@ -19,6 +19,7 @@ data/processed/
 .vscode/
 .idea/
 *.code-workspace
+.claude/
 
 # Operating system
 .DS_Store
@@ -27,6 +28,9 @@ desktop.ini
 
 # Logs
 *.log
+
+# Exported conversation logs (per-session user data, not source)
+logs/
 
 # Internal context file (not part of the public project)
 CLAUDE.md

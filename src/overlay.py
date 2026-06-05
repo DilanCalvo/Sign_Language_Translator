@@ -4,23 +4,19 @@ Letter accumulation buffer and subtitle UI.
 LetterBuffer collects stable letter predictions with a per-letter cooldown
 to prevent the same held pose from flooding the buffer, then draws the
 accumulated text as a subtitle strip at the bottom of the video frame.
-
-It also automatically conjugates verbs based on the preceding pronoun context.
 """
 
 import cv2
 import numpy as np
 
-from config import LETTER_COOLDOWN_FRAMES, DEFAULT_TENSE
-from src.grammar import conjugate_verb, is_pronoun, detect_tense
+from config import LETTER_COOLDOWN_FRAMES, WORD_SENTENCE_PAUSE_FRAMES
 
 _MAX_VISIBLE_CHARS = 50
 
 
 class LetterBuffer:
     """
-    Accumulates confirmed letter predictions into a running text line with
-    automatic verb conjugation based on pronoun context.
+    Accumulates confirmed letter predictions into a running text line.
 
     Call update() every frame with the current stable letter (or None).
     It returns True the frame a new character is accepted — use that
@@ -28,18 +24,16 @@ class LetterBuffer:
 
     Special values:
         "del"   → remove the last character
-        "space" → append a space (and trigger conjugation logic)
+        "space" → append a space
         any str → append uppercase
-
-    Conjugation:
-        When a space is added, the buffer checks if the previous complete word
-        is a pronoun. If it is, and the next complete word is a verb in the
-        grammar table, the verb is automatically conjugated to match the pronoun.
     """
 
     def __init__(self):
-        self._chars    = []
-        self._cooldown = 0
+        self._chars     = []
+        self._cooldown  = 0
+        # Words finalized by a space, waiting to be drained into the
+        # conversation log. See pop_completed_words().
+        self._completed = []
 
     def _get_last_word(self) -> str | None:
         """Extract the last complete word from _chars (before the final space)."""
@@ -49,11 +43,6 @@ class LetterBuffer:
         text = "".join(self._chars).rstrip()
         words = text.split()
         return words[-1] if words else None
-
-    def _extract_words(self) -> list[str]:
-        """Extract all words (non-space sequences) from _chars."""
-        text = "".join(self._chars)
-        return text.split()
 
     def update(self, letter) -> bool:
         """
@@ -71,118 +60,52 @@ class LetterBuffer:
             if self._chars:
                 self._chars.pop()
         elif letter == "space":
-            # After space is added, check if we need to conjugate the next word.
-            # We mark a special state to conjugate when the next word arrives.
+            # A space finalizes the current word. Record it (once) so the
+            # conversation log can capture spelled words, then append the space.
+            if self._chars and self._chars[-1] != " ":
+                finished = self._get_last_word()
+                if finished:
+                    self._completed.append(finished)
             self._chars.append(" ")
         else:
-            # Before adding the letter, check if we're starting a new word
-            # right after a space that follows a pronoun.
-            if self._should_conjugate_next_word():
-                # Replace the next word with its conjugated form.
-                letter = self._apply_conjugation(letter)
             self._chars.append(letter.upper())
 
         self._cooldown = LETTER_COOLDOWN_FRAMES
         return True
 
-    def _should_conjugate_next_word(self) -> bool:
+    def get_text(self) -> str:
+        """Return the accumulated text (last _MAX_VISIBLE_CHARS characters)."""
+        return "".join(self._chars[-_MAX_VISIBLE_CHARS:])
+
+    def pop_completed_words(self) -> list[str]:
         """
-        Check if the last word (before the last space) is a pronoun.
+        Return and clear the words finalized since the last call.
 
-        This is used to decide if we should conjugate the word that is about
-        to be added. If the last complete word is a pronoun, the next word
-        (the one about to start) should be conjugated.
+        Used by the conversation log to capture spelled words at word
+        boundaries without coupling the buffer to the logger.
         """
-        text = "".join(self._chars).rstrip()
-        words = text.split()
-        if not words:
-            return False
-
-        last_word = words[-1]
-        return is_pronoun(last_word)
-
-    def _apply_conjugation(self, first_letter: str) -> str:
-        """
-        If the upcoming word is a verb, conjugate it and return the first letter
-        of the conjugated form.
-
-        This is called at the moment the first letter of a new word arrives.
-        We don't have the full word yet, so we just return the first letter
-        (which will be uppercase). The conjugation is deferred until the
-        word is complete.
-
-        For now, we return the letter unchanged and conjugate at display time.
-        """
-        # Defer conjugation to display time (see _conjugate_for_display).
-        return first_letter
-
-    def _conjugate_for_display(self, text: str, override_tense: str | None = None) -> str:
-        """
-        Apply conjugation to the displayed text based on pronoun context and tense.
-
-        This processes the full accumulated text and conjugates verbs that
-        follow pronouns, applying the appropriate tense. It is called just
-        before display, ensuring we have complete words to work with.
-
-        Args:
-            text: accumulated text to conjugate
-            override_tense: if provided, use this tense instead of auto-detecting
-        """
-        words = text.split()
-        if len(words) < 2:
-            return text
-
-        # Detect tense: either from override or auto-detect from text
-        if override_tense:
-            tense = override_tense.lower()
-        else:
-            tense = detect_tense(text)
-
-        conjugated_words = []
-        for i, word in enumerate(words):
-            if i == 0:
-                conjugated_words.append(word)
-            else:
-                prev_word = words[i - 1]
-                if is_pronoun(prev_word):
-                    # Conjugate: convert word to lowercase, conjugate with tense, then uppercase
-                    conjugated = conjugate_verb(word.lower(), prev_word, tense=tense).upper()
-                    conjugated_words.append(conjugated)
-                else:
-                    conjugated_words.append(word)
-
-        return " ".join(conjugated_words)
-
-    def get_text(self, override_tense: str | None = None) -> str:
-        """
-        Return the accumulated text (last _MAX_VISIBLE_CHARS characters).
-
-        Args:
-            override_tense: if provided, force this tense instead of auto-detecting.
-                          Useful for manual tense selection (e.g., user presses 'T' for past).
-        """
-        raw_text = "".join(self._chars[-_MAX_VISIBLE_CHARS:])
-        return self._conjugate_for_display(raw_text, override_tense=override_tense)
+        words = self._completed
+        self._completed = []
+        return words
 
     def clear(self) -> None:
         self._chars.clear()
+        self._completed.clear()
         self._cooldown = 0
 
-    def draw_subtitle(self, frame, override_tense: str | None = None) -> None:
-        """
-        Draw a semi-transparent subtitle bar at the bottom of the frame.
-
-        Args:
-            frame: video frame to draw on
-            override_tense: if provided, use this tense instead of auto-detecting
-        """
-        text = self.get_text(override_tense=override_tense)
+    def draw_subtitle(self, frame) -> None:
+        """Draw a semi-transparent subtitle bar at the bottom of the frame."""
+        text = self.get_text()
         if not text:
             return
 
         h, w = frame.shape[:2]
         bar_h = 52
-        y0    = h - bar_h
+        # Lift the bar off the very bottom edge so it is never clipped by the
+        # window border / OS taskbar.
+        margin = 40
+        y1 = h - margin
+        y0 = y1 - bar_h
         padding = 14
         max_w = w - 2 * padding
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -199,18 +122,103 @@ class LetterBuffer:
                 text = text[1:]
                 (txt_w, _), _ = cv2.getTextSize(text, font, scale, thick)
 
-        # Semi-transparent dark background over the bottom strip
-        roi = frame[y0:h, 0:w]
+        # Semi-transparent dark background over the strip
+        roi = frame[y0:y1, 0:w]
         dark = roi.copy()
         dark[:] = (20, 20, 20)
         cv2.addWeighted(dark, 0.55, roi, 0.45, 0, roi)
-        frame[y0:h, 0:w] = roi
+        frame[y0:y1, 0:w] = roi
 
         cv2.putText(
             frame, text,
-            (padding, h - 14),
+            (padding, y1 - 16),
             font, scale,
             (255, 255, 255), thick, cv2.LINE_AA,
+        )
+
+
+class WordBuffer:
+    """
+    Accumulates whole-word signs (word mode) into a running sentence.
+
+    Each detected sign is appended so the bottom strip shows the recent
+    sequence of signs (e.g. "yo pensar"). The sentence auto-clears after
+    WORD_SENTENCE_PAUSE_FRAMES with no new sign, so the user just pauses to
+    start a fresh sentence (no key required).
+
+    Usage (word mode):
+        spoken = word_buffer.add(detected_word)  # on each new sign
+        word_buffer.tick()                       # every frame
+        word_buffer.draw_subtitle(frame)
+    """
+
+    def __init__(self):
+        self._words = []
+        self._idle  = 0   # frames since the last sign was added
+
+    def add(self, word) -> str | None:
+        """Append a detected sign and return it (the form to speak), or None."""
+        if not word:
+            return None
+        self._words.append(word)
+        self._idle = 0
+        return word
+
+    def tick(self) -> None:
+        """Advance the inactivity timer; auto-clear after the pause window."""
+        if not self._words:
+            return
+        self._idle += 1
+        if self._idle >= WORD_SENTENCE_PAUSE_FRAMES:
+            self.clear()
+
+    def get_text(self) -> str:
+        return " ".join(self._words)
+
+    def clear(self) -> None:
+        self._words.clear()
+        self._idle = 0
+
+    def draw_subtitle(self, frame) -> None:
+        """
+        Draw the accumulated sentence as a green-tinted bar at the bottom —
+        tinted to visually distinguish word mode from the gray letter subtitle.
+        """
+        text = self.get_text()
+        if not text:
+            return
+
+        h, w = frame.shape[:2]
+        bar_h = 52
+        # Lift the bar off the very bottom edge so it is never clipped.
+        margin = 40
+        y1 = h - margin
+        y0 = y1 - bar_h
+        padding = 14
+        max_w = w - 2 * padding
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 1.0
+        thick = 2
+
+        (txt_w, _), _ = cv2.getTextSize(text, font, scale, thick)
+        if txt_w > max_w:
+            scale = max(0.55, max_w / txt_w)
+            (txt_w, _), _ = cv2.getTextSize(text, font, scale, thick)
+            while txt_w > max_w and len(text) > 1:
+                text = text[1:]
+                (txt_w, _), _ = cv2.getTextSize(text, font, scale, thick)
+
+        roi = frame[y0:y1, 0:w]
+        dark = roi.copy()
+        dark[:] = (0, 30, 0)   # dark green tint
+        cv2.addWeighted(dark, 0.55, roi, 0.45, 0, roi)
+        frame[y0:y1, 0:w] = roi
+
+        cv2.putText(
+            frame, text,
+            (padding, y1 - 16),
+            font, scale,
+            (180, 255, 180), thick, cv2.LINE_AA,
         )
 
 

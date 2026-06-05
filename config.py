@@ -28,11 +28,12 @@ Sections:
 #                Letters are suppressed. Best for fluent communication with
 #                a known vocabulary.
 #
-#   "numbers"  → Reserved. For now it behaves like "letters". It will be
-#                enabled once a numbers model exists.
+#   "numbers"  → Detects ASL digits 0-9 (static poses, same pipeline as
+#                letters). Uses model/model_numbers.h5. If that model is not
+#                trained yet, the app shows a clear "numbers model not trained"
+#                notice instead of silently falling back to letters.
 #
-# Change this value to switch modes until a keyboard shortcut is exposed in
-# the UI.
+# Change this value to switch modes; L / W / N also switch at runtime.
 
 MODE = "words"
 
@@ -54,6 +55,36 @@ MODE = "words"
 # Recommended range: 0.70 - 0.90. Calibrated default: 0.80.
 
 LETTER_CONFIDENCE_THRESHOLD = 0.80
+
+# Minimum confidence required to show a NUMBER (0-9).
+#
+# Numbers are static poses classified exactly like letters (single frame,
+# 63 values), so the same calibration logic applies. Kept separate so it can
+# be tuned independently once a numbers model is trained.
+
+NUMBER_CONFIDENCE_THRESHOLD = 0.80
+
+# Low-confidence boundary for the "show alternatives" UI.
+#
+# This is INDEPENDENT of the acceptance thresholds above:
+#   - confidence >= LETTER/NUMBER threshold  -> the prediction is committed
+#     (added to the subtitle buffer and spoken).
+#   - confidence <  LOW_CONFIDENCE_THRESHOLD -> the model is unsure, so the
+#     HUD shows the top-3 candidates with their percentages instead of a
+#     single guess, letting the user see what the model is hesitating between.
+#   - in between -> the raw top-1 guess is shown small, but not committed.
+#
+# This decouples "what we trust enough to act on" from "what hints we surface".
+# Lower it to show alternatives less often; raise it to be more cautious.
+
+LOW_CONFIDENCE_THRESHOLD = 0.70
+
+# Minimum confidence for a candidate to appear in the alternatives list.
+#
+# Candidates below this are noise and would clutter the HUD. Replaces the
+# previously hardcoded runner-up cutoff.
+
+ALT_MIN_CONFIDENCE = 0.08
 
 # Minimum confidence required to show a WORD.
 #
@@ -198,6 +229,22 @@ WORD_SMOOTH_MIN_VOTES = 3
 
 WORD_COOLDOWN_FRAMES = 45
 
+# Frames of inactivity before the accumulated WORD sentence clears itself.
+#
+# In word mode, detected signs accumulate into a running sentence shown at the
+# bottom (e.g. "yo pensar"). The sentence resets on its own after this many
+# frames with no new sign, so the user just pauses to start a fresh sentence
+# (no key needed).
+#
+#   Raise → the sentence lingers longer; good for slow signers.
+#   Lower → clears sooner; risk of cutting a sentence mid-thought.
+#
+# Note: the per-word cooldown (WORD_COOLDOWN_FRAMES) counts against this too,
+# so the effective gap the user has between signs is this minus the cooldown.
+# Default: 150 frames ~= 5s at 30fps.
+
+WORD_SENTENCE_PAUSE_FRAMES = 150
+
 # ASL alphabet letters that require motion to be correct.
 #
 # These letters cannot be detected from a single static frame (J draws a
@@ -261,9 +308,11 @@ CAPTURE_OUTPUT_DIR = "data/real_capture/words"
 
 MODEL_ONE_HAND_PATH   = "model/model_one_hand.h5"
 MODEL_WORDS_PATH      = "model/model_words.h5"
+MODEL_NUMBERS_PATH    = "model/model_numbers.h5"
 
 LABELS_ONE_HAND_PATH  = "model/labels_one_hand.json"
 LABELS_WORDS_PATH     = "model/labels_words.json"
+LABELS_NUMBERS_PATH   = "model/labels_numbers.json"
 
 HAND_LANDMARKER_PATH  = "model/hand_landmarker.task"
 
@@ -350,337 +399,3 @@ SPEECH_WHISPER_MODEL = "tiny"
 # improve accuracy when the language is always known in advance.
 
 SPEECH_LANGUAGE = None
-
-
-# ================================================================
-#  10. GRAMMAR — verb conjugation with tense support
-# ================================================================
-
-# Verb conjugation tables by tense (present, past, future).
-#
-# Structure:
-#   "infinitive": {
-#       "present": {
-#           "1p_sg": "creo",          (present: yo)
-#           "2p_sg": "crees",         (present: tú)
-#           ...
-#       },
-#       "past": {
-#           "1p_sg": "creí",          (past: yo)
-#           "2p_sg": "creíste",       (past: tú)
-#           ...
-#       },
-#       "future": {
-#           "1p_sg": "creeré",        (future: yo)
-#           "2p_sg": "creerás",       (future: tú)
-#           ...
-#       },
-#   }
-#
-# ========================================================================
-# HOW TO ADD A NEW VERB:
-# ========================================================================
-# 1. Choose an infinitive (e.g., "hablar")
-# 2. Conjugate all 3 tenses × 6 forms = 18 forms total
-# 3. Copy the template below and fill in:
-#
-#    "hablar": {
-#        "present": {
-#            "1p_sg": "hablo",
-#            "2p_sg": "hablas",
-#            "3p_sg": "habla",
-#            "1p_pl": "hablamos",
-#            "2p_pl": "habláis",
-#            "3p_pl": "hablan",
-#        },
-#        "past": {
-#            "1p_sg": "hablé",
-#            "2p_sg": "hablaste",
-#            "3p_sg": "habló",
-#            "1p_pl": "hablamos",
-#            "2p_pl": "hablasteis",
-#            "3p_pl": "hablaron",
-#        },
-#        "future": {
-#            "1p_sg": "hablaré",
-#            "2p_sg": "hablarás",
-#            "3p_sg": "hablará",
-#            "1p_pl": "hablaremos",
-#            "2p_pl": "hablaréis",
-#            "3p_pl": "hablarán",
-#        },
-#    },
-#
-# IMPORTANT: If you forget a tense, that verb will not conjugate for
-# that tense. For safety, ALWAYS provide all 3 tenses (present, past, future).
-# ========================================================================
-
-VERB_CONJUGATIONS = {
-    "ser": {
-        "present": {
-            "1p_sg": "soy",
-            "2p_sg": "eres",
-            "3p_sg": "es",
-            "1p_pl": "somos",
-            "2p_pl": "sois",
-            "3p_pl": "son",
-        },
-        "past": {
-            "1p_sg": "fui",
-            "2p_sg": "fuiste",
-            "3p_sg": "fue",
-            "1p_pl": "fuimos",
-            "2p_pl": "fuisteis",
-            "3p_pl": "fueron",
-        },
-        "future": {
-            "1p_sg": "seré",
-            "2p_sg": "serás",
-            "3p_sg": "será",
-            "1p_pl": "seremos",
-            "2p_pl": "seréis",
-            "3p_pl": "serán",
-        },
-    },
-    "creer": {
-        "present": {
-            "1p_sg": "creo",
-            "2p_sg": "crees",
-            "3p_sg": "cree",
-            "1p_pl": "creemos",
-            "2p_pl": "creéis",
-            "3p_pl": "creen",
-        },
-        "past": {
-            "1p_sg": "creí",
-            "2p_sg": "creíste",
-            "3p_sg": "creyó",
-            "1p_pl": "creímos",
-            "2p_pl": "creísteis",
-            "3p_pl": "creyeron",
-        },
-        "future": {
-            "1p_sg": "creeré",
-            "2p_sg": "creerás",
-            "3p_sg": "creerá",
-            "1p_pl": "creeremos",
-            "2p_pl": "creeréis",
-            "3p_pl": "creerán",
-        },
-    },
-    "pensar": {
-        "present": {
-            "1p_sg": "pienso",
-            "2p_sg": "piensas",
-            "3p_sg": "piensa",
-            "1p_pl": "pensamos",
-            "2p_pl": "pensáis",
-            "3p_pl": "piensan",
-        },
-        "past": {
-            "1p_sg": "pensé",
-            "2p_sg": "pensaste",
-            "3p_sg": "pensó",
-            "1p_pl": "pensamos",
-            "2p_pl": "pensasteis",
-            "3p_pl": "pensaron",
-        },
-        "future": {
-            "1p_sg": "pensaré",
-            "2p_sg": "pensarás",
-            "3p_sg": "pensará",
-            "1p_pl": "pensaremos",
-            "2p_pl": "pensaréis",
-            "3p_pl": "pensarán",
-        },
-    },
-    "querer": {
-        "present": {
-            "1p_sg": "quiero",
-            "2p_sg": "quieres",
-            "3p_sg": "quiere",
-            "1p_pl": "queremos",
-            "2p_pl": "queréis",
-            "3p_pl": "quieren",
-        },
-        "past": {
-            "1p_sg": "quise",
-            "2p_sg": "quisiste",
-            "3p_sg": "quiso",
-            "1p_pl": "quisimos",
-            "2p_pl": "quisisteis",
-            "3p_pl": "quisieron",
-        },
-        "future": {
-            "1p_sg": "querré",
-            "2p_sg": "querrás",
-            "3p_sg": "querrá",
-            "1p_pl": "querremos",
-            "2p_pl": "querréis",
-            "3p_pl": "querrán",
-        },
-    },
-    "poder": {
-        "present": {
-            "1p_sg": "puedo",
-            "2p_sg": "puedes",
-            "3p_sg": "puede",
-            "1p_pl": "podemos",
-            "2p_pl": "podéis",
-            "3p_pl": "pueden",
-        },
-        "past": {
-            "1p_sg": "pude",
-            "2p_sg": "pudiste",
-            "3p_sg": "pudo",
-            "1p_pl": "pudimos",
-            "2p_pl": "pudisteis",
-            "3p_pl": "pudieron",
-        },
-        "future": {
-            "1p_sg": "podré",
-            "2p_sg": "podrás",
-            "3p_sg": "podrá",
-            "1p_pl": "podremos",
-            "2p_pl": "podréis",
-            "3p_pl": "podrán",
-        },
-    },
-    "tener": {
-        "present": {
-            "1p_sg": "tengo",
-            "2p_sg": "tienes",
-            "3p_sg": "tiene",
-            "1p_pl": "tenemos",
-            "2p_pl": "tenéis",
-            "3p_pl": "tienen",
-        },
-        "past": {
-            "1p_sg": "tuve",
-            "2p_sg": "tuviste",
-            "3p_sg": "tuvo",
-            "1p_pl": "tuvimos",
-            "2p_pl": "tuvisteis",
-            "3p_pl": "tuvieron",
-        },
-        "future": {
-            "1p_sg": "tendré",
-            "2p_sg": "tendrás",
-            "3p_sg": "tendrá",
-            "1p_pl": "tendremos",
-            "2p_pl": "tendréis",
-            "3p_pl": "tendrán",
-        },
-    },
-    "hacer": {
-        "present": {
-            "1p_sg": "hago",
-            "2p_sg": "haces",
-            "3p_sg": "hace",
-            "1p_pl": "hacemos",
-            "2p_pl": "hacéis",
-            "3p_pl": "hacen",
-        },
-        "past": {
-            "1p_sg": "hice",
-            "2p_sg": "hiciste",
-            "3p_sg": "hizo",
-            "1p_pl": "hicimos",
-            "2p_pl": "hicisteis",
-            "3p_pl": "hicieron",
-        },
-        "future": {
-            "1p_sg": "haré",
-            "2p_sg": "harás",
-            "3p_sg": "hará",
-            "1p_pl": "haremos",
-            "2p_pl": "haréis",
-            "3p_pl": "harán",
-        },
-    },
-    "ir": {
-        "present": {
-            "1p_sg": "voy",
-            "2p_sg": "vas",
-            "3p_sg": "va",
-            "1p_pl": "vamos",
-            "2p_pl": "vais",
-            "3p_pl": "van",
-        },
-        "past": {
-            "1p_sg": "fui",
-            "2p_sg": "fuiste",
-            "3p_sg": "fue",
-            "1p_pl": "fuimos",
-            "2p_pl": "fuisteis",
-            "3p_pl": "fueron",
-        },
-        "future": {
-            "1p_sg": "iré",
-            "2p_sg": "irás",
-            "3p_sg": "irá",
-            "1p_pl": "iremos",
-            "2p_pl": "iréis",
-            "3p_pl": "irán",
-        },
-    },
-}
-
-# Pronouns mapped to grammatical forms (no changes from before).
-
-PRONOUN_TO_FORM = {
-    "yo": "1p_sg",
-    "i": "1p_sg",
-    "tú": "2p_sg",
-    "tu": "2p_sg",
-    "you": "2p_sg",
-    "él": "3p_sg",
-    "she": "3p_sg",
-    "ella": "3p_sg",
-    "usted": "3p_sg",
-    "ud": "3p_sg",
-    "he": "3p_sg",
-    "nosotros": "1p_pl",
-    "nosotras": "1p_pl",
-    "we": "1p_pl",
-    "vosotros": "2p_pl",
-    "vosotras": "2p_pl",
-    "you_all": "2p_pl",
-    "ellos": "3p_pl",
-    "ellas": "3p_pl",
-    "they": "3p_pl",
-    "ustedes": "3p_pl",
-    "uds": "3p_pl",
-}
-
-# Time markers: words that indicate the tense context.
-#
-# When the system detects one of these words, it switches to that tense
-# for all following verbs. Case-insensitive.
-#
-# Examples:
-#   "ayer yo creer" → detects "ayer" → past tense → "ayer yo creí"
-#   "mañana ellos ir" → detects "mañana" → future tense → "mañana ellos irán"
-
-TIME_MARKERS = {
-    # Past tense
-    "ayer": "past",
-    "anoche": "past",
-    "hace": "past",
-    "pasado": "past",
-    "hace tiempo": "past",
-    # Present tense
-    "ahora": "present",
-    "hoy": "present",
-    "en": "present",  # "en este momento"
-    "ahorita": "present",
-    # Future tense
-    "mañana": "future",
-    "próximo": "future",
-    "luego": "future",
-    "después": "future",
-    "pronto": "future",
-}
-
-# Default tense when no marker is detected.
-DEFAULT_TENSE = "present"

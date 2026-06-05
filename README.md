@@ -77,9 +77,7 @@ python main.py
 | **L** | Switch to letters mode |
 | **W** | Switch to words mode |
 | **N** | Switch to numbers mode |
-| **T** | Force past tense (conjugation) |
-| **R** | Force present tense (conjugation, default) |
-| **F** | Force future tense (conjugation) |
+| **E** | Export the conversation log (TXT + CSV to `logs/`) |
 | **P** | Toggle speech-to-text microphone (if enabled) |
 
 The pre-trained models are already in the repo, so the app runs right after
@@ -95,19 +93,20 @@ The active mode is set in [config.py](config.py) with the `MODE` variable:
 |---|---|
 | `"letters"` | Shows static letters (A–Y). Best for finger-spelling. |
 | `"words"` | Shows whole-word signs (the default). Best for fluent signs. |
-| `"numbers"` | Reserved — behaves like `"letters"` until a numbers model exists. |
+| `"numbers"` | Digits 0–9. Shows a clear notice until a numbers model is trained. |
 
 On screen you will see the detected letter/word, a confidence bar (green > 80%,
-yellow > 60%, red below), and the current mode. `config.py` is heavily
-commented — every threshold and timing value is documented there.
+yellow > 60%, red below), the current mode, and — when the model is unsure
+(< 70%) — the top-3 candidates so you can see what it is weighing. `config.py`
+is heavily commented — every threshold and timing value is documented there.
 
 **What the included models currently recognize:**
 
 - **Letters:** A–Y as static poses, except **J** and **Z** (these need motion
   and are flagged with a "requires motion" hint).
-- **Words:** `hola`, `adios`, `Yo` (plus a negative "nothing" class). The word
-  labels are in Spanish because they are the signs the team captured — you can
-  capture and train any vocabulary you want (see below).
+- **Words:** `hola`, `adios`, `yo`, `pensar` (plus a negative `nada` class). The
+  word labels are in Spanish because they are the signs the team captured — you
+  can capture and train any vocabulary you want (see below).
 
 ---
 
@@ -158,8 +157,8 @@ sweep, and saves confusion-matrix PNGs to `model/`.
 
 ```
 Sign_Language_Translator/
-├── main.py                  # Entry point — real-time translator with tense selector
-├── config.py                # Single source of truth for all parameters (includes verb conjugations)
+├── main.py                  # Entry point — real-time translator
+├── config.py                # Single source of truth for all parameters
 ├── requirements.txt         # Dependencies
 │
 ├── src/
@@ -167,8 +166,8 @@ Sign_Language_Translator/
 │   ├── classifier.py        # Loads models and classifies in real time
 │   ├── utils.py             # normalize_landmarks + PredictionSmoother
 │   ├── voice.py             # Speech synthesis (Windows SAPI5, offline)
-│   ├── overlay.py           # LetterBuffer (accumulation + conjugation) + SpeechBuffer (transcripts)
-│   ├── grammar.py           # Verb conjugation system (deterministic, no ML)
+│   ├── overlay.py           # LetterBuffer + WordBuffer + SpeechBuffer (subtitle bars)
+│   ├── conversation_log.py  # Exportable conversation log (TXT + CSV)
 │   └── speech_input.py      # Speech-to-text (Whisper, push-to-talk with P key)
 │
 ├── capture/
@@ -180,26 +179,16 @@ Sign_Language_Translator/
 │   ├── train_words.py       # Train the word model
 │   └── evaluate.py          # Metrics + confusion matrices
 │
-├── scripts/
-│   └── export_grammar.py    # Export conjugation tables to JSON (for web)
-│
 ├── model/
 │   ├── model_one_hand.h5    # Letter classification model
 │   ├── model_words.h5       # Word/dynamic-sign classification model
 │   ├── labels_one_hand.json # Letter labels (A–Y)
-│   ├── labels_words.json    # Word labels (hola, adios, Yo, nada)
-│   ├── hand_landmarker.task # MediaPipe hand detection model
-│   └── grammar.json         # Conjugation tables (auto-generated, for web)
+│   ├── labels_words.json    # Word labels (hola, adios, yo, pensar, nada)
+│   └── hand_landmarker.task # MediaPipe hand detection model
 │
-├── data/real_capture/       # Sample captured CSVs (landmarks)
-│   ├── letters/
-│   └── words/
-│
-├── ROADMAP.md               # Detailed roadmap + architecture decisions + scalability analysis
-├── HOW_TO_ADD_VERBS.md      # Guide: add new Spanish verbs with all 3 tenses
-├── GRAMMAR_WEB_PLAN.md      # Grammar system + web migration plan
-├── GRAMMAR_SHORT.md         # 1-page summary of conjugation
-└── CLAUDE.md                # Internal project context (Spanish)
+└── data/real_capture/       # Sample captured CSVs (landmarks)
+    ├── letters/
+    └── words/
 ```
 
 ---
@@ -223,50 +212,24 @@ Everything required to run **and** to retrain is in the repository.
 
 ---
 
-## Documentation
-
-**For roadmap, architecture, and future improvements:**
-
-- **[ROADMAP.md](ROADMAP.md)** — Detailed roadmap with phases, architecture decisions, and analysis of future scalability solutions (how to handle 500+ verbs efficiently, when to migrate to web, etc.)
-
-**For verb conjugation and tenses:**
-
-- **[HOW_TO_ADD_VERBS.md](HOW_TO_ADD_VERBS.md)** — Step-by-step guide to add new Spanish verbs with all 3 tenses (present, past, future)
-- **[GRAMMAR_WEB_PLAN.md](GRAMMAR_WEB_PLAN.md)** — Detailed grammar architecture, web migration plan, and improvement roadmap
-- **[GRAMMAR_SHORT.md](GRAMMAR_SHORT.md)** — Quick 1-page summary of conjugation system
-
-**For system design:**
-
-- **[CLAUDE.md](CLAUDE.md)** — Internal project context (Spanish, for team use)
-
----
-
 ## Current Status (MVP)
 
 ✅ **Implemented:**
 - Real-time hand detection (MediaPipe)
 - Letter recognition (A–Y static)
-- Word / dynamic-sign recognition (4 words)
-- Verb conjugation (8 verbs, 3 tenses: present, past, future)
+- Word / dynamic-sign recognition
+- Confidence bar + top-3 alternatives when the model is unsure (< 70%)
 - Speech synthesis (Windows SAPI5, offline)
 - Speech-to-text (Whisper, push-to-talk with P key)
-- Letter accumulation + text overlay with auto-conjugation
-- Tense auto-detection (ayer → past, mañana → future)
+- Letter / word accumulation with subtitle overlay
+- Exportable conversation log (E key → TXT + CSV)
 - Capture + training pipeline
 
-🔜 **Short-term (Phase 2):**
-- Expand vocabulary (50+ verbs)
-- Tiempos compuestos (present perfect: "he creído")
-- Web MVP (React + tensorflowjs)
-
-💡 **Future (Phase 3+):**
-- Refactor to pattern-based conjugation (scalable to 500+ verbs)
-- Multi-language support (English, ASL British)
-- Mobile app (iOS / Android)
-- Subjuntivo, condicional
-- Full web platform with API
-
-See **[ROADMAP.md](ROADMAP.md)** for detailed phases and decision rationale. |
+🔜 **Next:**
+- Numbers model (0–9)
+- Dynamic J / Z letters
+- Expand the word vocabulary
+- Web migration (tensorflowjs + MediaPipe.js)
 
 ---
 
