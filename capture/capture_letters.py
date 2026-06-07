@@ -40,15 +40,11 @@ from src.detector import Detector
 # Letters to capture. Edit this list to capture only the ones you need
 # (e.g. the most confusing: N, M, E, S, A). Full alphabet for reference:
 #
-# LABELS = [
-#     "A","B","C","D","E","F","G","H","I","J",
-#     "K","L","M","N","O","P","Q","R","S","T",
-#     "U","V","W","X","Y","Z","del","space",
-# ]
-
 LABELS = [
-    "Y",
-]
+     "A","B","C","D","E","F","G","H","I","J",
+     "K","L","M","N","O","P","Q","R","S","T",
+     "U","V","W","X","Y","Z","del","space",
+ ]
 
 TARGET_PER_LABEL  = 150    # samples to capture per letter
 MIN_INTERVAL      = 0.65   # minimum seconds between automatic captures

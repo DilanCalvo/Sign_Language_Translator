@@ -11,12 +11,17 @@ from config import (
     SPEECH_INPUT_ENABLED,
     SPEECH_WHISPER_MODEL,
     SPEECH_LANGUAGE,
+    TRANSLATION_ENABLED,
+    TRANSLATION_TARGET_LANGUAGE,
+    TRANSLATION_MODEL,
+    TRANSLATION_OFFLINE_FALLBACK,
 )
 from src.classifier import Classifier
 from src.conversation_log import ConversationLog
 from src.detector import Detector
 from src.overlay import LetterBuffer, SpeechBuffer, WordBuffer
 from src.speech_input import SpeechInput, SpeechState
+from src.translator import Translator
 from src.utils import PredictionSmoother
 from src.voice import VoiceOutput
 
@@ -70,6 +75,37 @@ def _draw_alternatives(frame, top3):
         color = _WHITE if i == 0 else _GRAY
         cv2.putText(frame, line, (w // 2 - 110, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
+
+
+def _draw_translation(frame, text, status):
+    """
+    Draw the LLM-translated sentence as a cyan banner above the word subtitle.
+
+    status: "translating" shows a spinner-ish hint; "" hides the bar unless
+    there is text to show (the last translation lingers until the next one).
+    """
+    if not text and status != "translating":
+        return
+    h, w = frame.shape[:2]
+    bar_h = 50
+    y1 = h - 96          # sits just above the bottom word-subtitle bar
+    y0 = y1 - bar_h
+    roi = frame[y0:y1, 0:w]
+    tint = roi.copy(); tint[:] = (60, 40, 10)   # dark teal/navy
+    cv2.addWeighted(tint, 0.6, roi, 0.4, 0, roi)
+    frame[y0:y1, 0:w] = roi
+
+    label = "translating..." if status == "translating" else "translation:"
+    cv2.putText(frame, label, (12, y0 + 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, _CYAN, 1, cv2.LINE_AA)
+    if text:
+        scale, thick = 0.8, 2
+        (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+        while tw > w - 24 and scale > 0.45:
+            scale -= 0.05
+            (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+        cv2.putText(frame, text, (12, y1 - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, _WHITE, thick, cv2.LINE_AA)
 
 
 def _draw_hud(frame, stable, raw_result, stable_word=None, stable_word_conf=0.0,
@@ -215,14 +251,27 @@ def main():
             language=SPEECH_LANGUAGE,
         )
 
+    translator = Translator(
+        model=TRANSLATION_MODEL,
+        target_language=TRANSLATION_TARGET_LANGUAGE,
+        enabled=TRANSLATION_ENABLED,
+        offline_fallback=TRANSLATION_OFFLINE_FALLBACK,
+    )
+
     # Word cooldown state.
     locked_word      = None
     locked_word_conf = 0.0
     cooldown_frames  = 0
 
+    # Translation display state (the LLM-produced sentence + its status).
+    translation_text   = ""
+    translation_status = ""   # "translating" while a request is in flight
+
     print("Camera started.")
     print("  Q: quit  |  L: letters  |  W: words  |  N: numbers")
-    print("  E: export conversation log")
+    print("  E: export conversation log  |  T: translate signed sentence")
+    if not translator.online and TRANSLATION_ENABLED:
+        print(f"  [translate] offline mode ({translator.reason}); T joins glosses as-is")
     if speech_input is not None:
         print("  P: toggle microphone  (push-to-talk speech recognition)")
 
@@ -298,6 +347,17 @@ def main():
                 speech_buffer.add(transcript)
                 conv_log.add_speech(transcript)
 
+        # ----- Translation result (LLM gloss -> sentence) -----
+        ready = translator.poll()
+        if ready is not None:
+            translation_text   = ready
+            translation_status = ""
+            if voice:
+                voice.speak(ready)
+            conv_log.add("Traduccion", ready)
+        elif not translator.busy:
+            translation_status = ""
+
         # ----- Draw -----
         _draw_hud(
             frame, stable, raw_result, stable_word, word_conf,
@@ -309,6 +369,7 @@ def main():
         if mode in ("letters", "numbers"):
             letter_buffer.draw_subtitle(frame)
         elif mode == "words":
+            _draw_translation(frame, translation_text, translation_status)
             word_buffer.draw_subtitle(frame)
 
         speech_status = speech_input.state.name.lower() if speech_input else ""
@@ -328,9 +389,11 @@ def main():
             word_smoother.reset()
             letter_buffer.clear()
             word_buffer.clear()
-            locked_word      = None
-            locked_word_conf = 0.0
-            cooldown_frames  = 0
+            locked_word        = None
+            locked_word_conf   = 0.0
+            cooldown_frames    = 0
+            translation_text   = ""
+            translation_status = ""
 
         elif key == ord('w'):
             mode = "words"
@@ -338,9 +401,11 @@ def main():
             word_smoother.reset()
             letter_buffer.clear()
             word_buffer.clear()
-            locked_word      = None
-            locked_word_conf = 0.0
-            cooldown_frames  = 0
+            locked_word        = None
+            locked_word_conf   = 0.0
+            cooldown_frames    = 0
+            translation_text   = ""
+            translation_status = ""
 
         elif key == ord('n'):
             mode = "numbers"
@@ -348,9 +413,11 @@ def main():
             word_smoother.reset()
             letter_buffer.clear()
             word_buffer.clear()
-            locked_word      = None
-            locked_word_conf = 0.0
-            cooldown_frames  = 0
+            locked_word        = None
+            locked_word_conf   = 0.0
+            cooldown_frames    = 0
+            translation_text   = ""
+            translation_status = ""
 
         elif key == ord('e'):
             path = conv_log.export()
@@ -358,6 +425,19 @@ def main():
                 print(f"[LOG] Conversation exported ({len(conv_log)} entries) -> {path}")
             else:
                 print("[LOG] Nothing to export yet.")
+
+        elif key == ord('t'):
+            # Translate the signed sentence so far (the gloss buffer) into a
+            # fluent sentence via the LLM layer. Result arrives asynchronously
+            # and is picked up by translator.poll() above.
+            glosses = word_buffer.get_words()
+            if glosses:
+                if translator.submit(glosses):
+                    translation_status = "translating"
+                # If submit returned False but we are offline, the fallback was
+                # already queued and poll() will pick it up next frame.
+            else:
+                print("[translate] No signs to translate yet.")
 
         elif key == ord('p') and speech_input is not None:
             if speech_input.state == SpeechState.IDLE:

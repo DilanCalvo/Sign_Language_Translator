@@ -25,10 +25,14 @@ we act on" from "what hints we surface".
 
 word_prediction: dynamic-sign prediction. It is None when:
   - the word model is not loaded,
-  - the buffer does not yet hold WORD_SEQ_FRAMES frames,
+  - the buffer does not yet hold WORD_MIN_FRAMES frames,
   - hand motion is below WORD_MIN_MOTION_STD (static pose),
   - the model confidence is below WORD_CONFIDENCE_THRESHOLD,
-  - or the predicted class is the negative class WORD_NULL_LABEL ("nada").
+  - or the predicted class is the negative class WORD_NULL_LABEL ("nothing").
+
+The word model is a TEMPORAL sequence model (TCN): the rolling buffer of recent
+normalized frames is resampled to WORD_SEQ_LEN and fed as a (1, WORD_SEQ_LEN, 63)
+tensor — it reads the movement over time, not an order-blind mean+std summary.
 """
 
 import json
@@ -45,7 +49,9 @@ from config import (
     LABELS_ONE_HAND_PATH  as _LABELS_ONE,
     LABELS_WORDS_PATH     as _LABELS_WORDS,
     LABELS_NUMBERS_PATH   as _LABELS_NUMBERS,
-    WORD_SEQ_FRAMES       as _SEQ_FRAMES,
+    WORD_SEQ_LEN          as _SEQ_LEN,
+    WORD_BUFFER_FRAMES    as _BUFFER_FRAMES,
+    WORD_MIN_FRAMES       as _MIN_FRAMES,
     WORD_MOTION_WINDOW    as _MOTION_WINDOW,
     WORD_NULL_LABEL       as _NULL_WORD_LABEL,
     LETTER_CONFIDENCE_THRESHOLD as _LETTER_THRESHOLD,
@@ -54,7 +60,7 @@ from config import (
     WORD_MIN_MOTION_STD   as _MIN_MOTION_STD,
     ALT_MIN_CONFIDENCE    as _ALT_MIN_CONFIDENCE,
 )
-from src.utils import normalize_landmarks
+from src.utils import normalize_landmarks, resample_sequence
 
 
 class Classifier:
@@ -68,11 +74,11 @@ class Classifier:
         self._model_one  = tf.keras.models.load_model(_MODEL_ONE, compile=False)
         self._labels_one = self._load_labels(_LABELS_ONE)
 
-        # The word model is optional — a buffer of SEQ_FRAMES normalized
-        # landmarks turned into mean+std (126 features) for each inference.
+        # The word model is optional — a rolling buffer of recent normalized
+        # frames, resampled to WORD_SEQ_LEN and fed to the temporal model (TCN).
         self._model_words  = None
         self._labels_words = None
-        self._word_buffer  = deque(maxlen=_SEQ_FRAMES)
+        self._word_buffer  = deque(maxlen=_BUFFER_FRAMES)
         if os.path.isfile(_MODEL_WORDS) and os.path.isfile(_LABELS_WORDS):
             labels_candidate = self._load_labels(_LABELS_WORDS)
             if len(labels_candidate) < 2:
@@ -85,8 +91,24 @@ class Classifier:
                     "         Capture more words with: python capture/capture_words.py"
                 )
             else:
-                self._model_words  = tf.keras.models.load_model(_MODEL_WORDS, compile=False)
-                self._labels_words = labels_candidate
+                candidate = tf.keras.models.load_model(_MODEL_WORDS, compile=False)
+                # Be honest about an incompatible (legacy) model instead of
+                # crashing at inference. The temporal model takes a 3-D input
+                # (batch, time, 63); the old mean+std model took a 2-D (batch,
+                # 126). If we find the old one, disable words and tell the user
+                # to retrain — letters keep working.
+                if len(candidate.input_shape) != 3:
+                    print(
+                        "  [WARN] The word model is the old mean+std format "
+                        f"(input {candidate.input_shape}); the app now uses a "
+                        "temporal sequence model.\n"
+                        "         Re-train it: python training/train_words.py "
+                        "(after capturing with capture/capture_words.py).\n"
+                        "         Word mode is disabled until then; letters still work."
+                    )
+                else:
+                    self._model_words  = candidate
+                    self._labels_words = labels_candidate
 
         # The numbers model is optional and shares the letter pipeline (single
         # frame, 63 values). It stays None until the team trains 0-9; the app
@@ -208,30 +230,29 @@ class Classifier:
             return None
         normalized = normalize_landmarks(h1_flat)
         self._word_buffer.append(normalized)
-        if len(self._word_buffer) < _SEQ_FRAMES:
+        if len(self._word_buffer) < _MIN_FRAMES:
             self._last_motion = 0.0
             return None
         return self._run_words()
 
     def _run_words(self):
-        arr = np.array(list(self._word_buffer), dtype=np.float32)  # (20, 63)
-
-        # Full std: the word model features (what it was trained on).
-        std_per_coord = arr.std(axis=0)                              # (63,)
+        arr = np.array(list(self._word_buffer), dtype=np.float32)  # (<=BUFFER, 63)
 
         # Motion over only the most recent frames: detects quickly when the
-        # user stops the hand. Averaging all 20 frames would keep a motion
-        # from 0.5s ago counting, delaying letters. A short window solves this
-        # without losing word-detection accuracy (that uses the full buffer).
-        recent = arr[-_MOTION_WINDOW:]                               # (8, 63)
+        # user stops the hand. Averaging the whole buffer would keep a motion
+        # from a moment ago counting, delaying the return to letters.
+        recent = arr[-_MOTION_WINDOW:]
         motion = float(recent.std(axis=0).mean())
         self._last_motion = motion
 
         if motion < _MIN_MOTION_STD:
             return None
 
-        feat   = np.concatenate([arr.mean(axis=0), std_per_coord])  # (126,)
-        tensor = tf.constant(feat[np.newaxis], dtype=tf.float32)
+        # Resample the variable-length buffer to the fixed sequence length the
+        # model was trained on (same helper capture used), then classify the
+        # ordered sequence. This is the temporal step the old mean+std lacked.
+        seq    = resample_sequence(list(self._word_buffer), _SEQ_LEN)  # (T, 63)
+        tensor = tf.constant(seq[np.newaxis], dtype=tf.float32)        # (1, T, 63)
         probs  = self._model_words(tensor, training=False).numpy()[0]
         idx    = int(np.argmax(probs))
         conf   = float(probs[idx])
@@ -239,7 +260,7 @@ class Classifier:
             return None
 
         label = self._labels_words[idx]
-        # The negative class ("nada") means "the model thinks this is not a
+        # The negative class ("nothing") means "the model thinks this is not a
         # deliberate word" — we treat that prediction as None.
         if label == _NULL_WORD_LABEL:
             return None
@@ -249,7 +270,7 @@ class Classifier:
     def _warmup(self):
         self._model_one(tf.zeros((1, 63), dtype=tf.float32), training=False)
         if self._model_words is not None:
-            self._model_words(tf.zeros((1, 126), dtype=tf.float32), training=False)
+            self._model_words(tf.zeros((1, _SEQ_LEN, 63), dtype=tf.float32), training=False)
         if self._model_numbers is not None:
             self._model_numbers(tf.zeros((1, 63), dtype=tf.float32), training=False)
 

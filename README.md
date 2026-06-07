@@ -41,10 +41,23 @@ There are two models:
 | Model | Input | Detects |
 |---|---|---|
 | **Letters** (`model_one_hand.h5`) | 63 landmark values (one frame) | Static ASL letters |
-| **Words** (`model_words.h5`) | 126 values (mean + std over 20 frames) | Dynamic signs / whole words |
+| **Words** (`model_words.h5`) | a sequence of 32 frames × 63 values | Dynamic signs / whole words |
 
-The words model uses 20 frames of motion, so it can recognize signs that
-require movement, which a single static frame cannot capture.
+The words model is a **temporal sequence model** (a TCN — stacked 1-D
+convolutions over time). It reads the *ordered* movement of the hand, so it can
+tell signs apart by *how* the hand moves, not just the average pose. This is the
+key to scaling the vocabulary: a movement summary that ignores order collapses
+once two signs share a similar average shape.
+
+### Two-stage design: recognize, then translate
+
+Recognition outputs **glosses** — English keywords in citation form
+(`WANT DRINK NOW`). A second stage sends those to an LLM (Claude) which produces
+a fluent sentence with correct grammar and tense (*"Quiero tomar algo ahora."*).
+Conjugation and tense live in the translation layer, not the recognizer: ASL
+doesn't conjugate verbs, so teaching the recognizer conjugated forms would be
+both wrong and explosive. Press **T** in words mode to translate the signed
+sentence. Works offline too (falls back to the raw glosses).
 
 ---
 
@@ -78,7 +91,12 @@ python main.py
 | **W** | Switch to words mode |
 | **N** | Switch to numbers mode |
 | **E** | Export the conversation log (TXT + CSV to `logs/`) |
+| **T** | Translate the signed sentence to fluent text (words mode) |
 | **P** | Toggle speech-to-text microphone (if enabled) |
+
+The translation layer uses the Claude API. Set `ANTHROPIC_API_KEY` in your
+environment to enable it; without a key the app still runs and **T** just joins
+the recognized glosses. Tune it in [config.py](config.py) section 10.
 
 The pre-trained models are already in the repo, so the app runs right after
 installing — no dataset download or training required.
@@ -104,9 +122,11 @@ is heavily commented — every threshold and timing value is documented there.
 
 - **Letters:** A–Y as static poses, except **J** and **Z** (these need motion
   and are flagged with a "requires motion" hint).
-- **Words:** `hola`, `adios`, `yo`, `pensar` (plus a negative `nada` class). The
-  word labels are in Spanish because they are the signs the team captured — you
-  can capture and train any vocabulary you want (see below).
+- **Words:** a curated set of conversational ASL glosses (English) plus a
+  negative `nothing` class that keeps the model silent when you are not signing.
+  You capture and train whatever vocabulary you want (see below). The `nothing`
+  class is essential — without it a closed-set classifier labels *everything* as
+  some word and never stays quiet.
 
 ---
 
@@ -127,29 +147,30 @@ python capture/capture_words.py
 ```
 
 Edit the `LABELS` / `WORDS` list at the top of each script to choose what to
-capture. Each session saves a timestamped CSV under `data/real_capture/`.
+capture. Letter captures save timestamped CSVs; word captures save one `.npy`
+sequence per take plus a `manifest.csv` under
+`data/real_capture/words/`.
 
-### 2. Point the training scripts at your CSVs
+**Capture across multiple sessions.** For words especially, re-run the capture
+script on different days (different lighting, clothing, distance). The script
+*appends*, so this builds a multi-session dataset. A model trained on many takes
+from a single session memorizes that session and fails live — varied sessions
+are what make it generalize. This is the single most important factor for
+reliable word recognition.
 
-Add the generated CSV paths to the `DATA_CSVS` list in
-[training/train_letters.py](training/train_letters.py) or
-[training/train_words.py](training/train_words.py).
+### 2. Train
 
-### 3. Train
+The word trainer reads `data/real_capture/words/manifest.csv` directly — no
+paths to edit. (The letter trainer still uses its `DATA_CSVS` list.)
 
 ```bash
 python training/train_letters.py     # produces model/model_one_hand.h5
-python training/train_words.py       # produces model/model_words.h5
+python training/train_words.py       # produces model/model_words.h5 (TCN)
 ```
 
-### 4. (Optional) Evaluate
-
-```bash
-python training/evaluate.py
-```
-
-This prints per-class accuracy, top confusions, and a confidence-threshold
-sweep, and saves confusion-matrix PNGs to `model/`.
+`train_words.py` reports validation accuracy, but note: if your validation takes
+come from the same session as training, that number is optimistic. Real
+precision shows up on signs captured on a *different* day.
 
 ---
 
@@ -164,31 +185,31 @@ Sign_Language_Translator/
 ├── src/
 │   ├── detector.py          # Camera + MediaPipe hand landmarks (21 per hand)
 │   ├── classifier.py        # Loads models and classifies in real time
-│   ├── utils.py             # normalize_landmarks + PredictionSmoother
+│   ├── utils.py             # normalize_landmarks + resample_sequence + PredictionSmoother
 │   ├── voice.py             # Speech synthesis (Windows SAPI5, offline)
 │   ├── overlay.py           # LetterBuffer + WordBuffer + SpeechBuffer (subtitle bars)
 │   ├── conversation_log.py  # Exportable conversation log (TXT + CSV)
-│   └── speech_input.py      # Speech-to-text (Whisper, push-to-talk with P key)
+│   ├── speech_input.py      # Speech-to-text (Whisper, push-to-talk with P key)
+│   └── translator.py        # ASL glosses -> fluent sentence (Claude API, T key)
 │
 ├── capture/
 │   ├── capture_letters.py   # Capture static letter samples
-│   └── capture_words.py     # Capture dynamic word sequences
+│   └── capture_words.py     # Capture dynamic word sequences (.npy + manifest)
 │
 ├── training/
 │   ├── train_letters.py     # Train the letter model
-│   ├── train_words.py       # Train the word model
-│   └── evaluate.py          # Metrics + confusion matrices
+│   └── train_words.py       # Train the word model (temporal TCN)
 │
 ├── model/
 │   ├── model_one_hand.h5    # Letter classification model
-│   ├── model_words.h5       # Word/dynamic-sign classification model
+│   ├── model_words.h5       # Word/dynamic-sign classification model (TCN)
 │   ├── labels_one_hand.json # Letter labels (A–Y)
-│   ├── labels_words.json    # Word labels (hola, adios, yo, pensar, nada)
+│   ├── labels_words.json    # Word labels (ASL glosses + negative "nothing")
 │   └── hand_landmarker.task # MediaPipe hand detection model
 │
-└── data/real_capture/       # Sample captured CSVs (landmarks)
-    ├── letters/
-    └── words/
+└── data/real_capture/       # Sample captured data (landmarks)
+    ├── letters/             # letter CSVs
+    └── words/               # word sequences (seq/*.npy) + manifest.csv
 ```
 
 ---

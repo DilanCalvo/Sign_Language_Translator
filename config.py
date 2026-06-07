@@ -24,9 +24,11 @@ Sections:
 #   "letters"  → Detects ASL alphabet letters (A-Z). The word model runs
 #                internally but its result is not shown. Best for spelling.
 #
-#   "words"    → Detects dynamic signs / whole words (hola, adios, ...).
-#                Letters are suppressed. Best for fluent communication with
-#                a known vocabulary.
+#   "words"    → Detects dynamic signs / whole words (ASL glosses: yes, no,
+#                want, ...). Letters are suppressed. Best for fluent
+#                communication with a curated vocabulary. The recognized glosses
+#                can be turned into a fluent sentence by the LLM translation
+#                layer (see section 10 and src/translator.py).
 #
 #   "numbers"  → Detects ASL digits 0-9 (static poses, same pipeline as
 #                letters). Uses model/model_numbers.h5. If that model is not
@@ -86,42 +88,66 @@ LOW_CONFIDENCE_THRESHOLD = 0.70
 
 ALT_MIN_CONFIDENCE = 0.08
 
-# Minimum confidence required to show a WORD.
+# Minimum confidence required to commit a WORD.
 #
-# The word model has a softmax over N classes; the more classes, the lower
-# the natural peak probabilities. With 3 classes the real ceiling is
-# ~0.65-0.70 (dropout + regularization suppress it).
+# The word model has a softmax over N classes (including the negative
+# "nothing" class). The negative class absorbs the probability mass of
+# ambiguous frames, so genuine signs peak higher and false positives are
+# already filtered by the negative class — a moderate threshold works well.
 #
-#   Raise → stricter. With the current model (few classes) values > 0.70
-#           reject almost everything. Only raise it with >5 classes and many
-#           false positives.
-#   Lower → accepts less certain predictions. Lower to 0.40 if a new, larger
-#           model produces lower confidences.
+#   Raise → stricter; fewer false positives, may drop borderline real signs.
+#   Lower → accepts less certain predictions; raise if you see misfires.
 #
-# Calibrate with: python training/evaluate.py (the "threshold sweep" table).
-# Empirically calibrated default for a small word model: 0.50.
+# Default: 0.60 (TCN sequence model with a trained negative class).
 
-WORD_CONFIDENCE_THRESHOLD = 0.50
+WORD_CONFIDENCE_THRESHOLD = 0.60
 
 
 # ================================================================
-#  3. MOTION — dynamic-sign detection
+#  3. MOTION & SEQUENCE — dynamic-sign detection
 # ================================================================
 
-# Number of frames accumulated to analyze a complete sign.
+# Length (in frames) of the sequence the WORD model consumes.
 #
-# CRITICAL WARNING: this value MUST be identical to the one used when
-# capturing the data (CAPTURE_SEQ_FRAMES) and when training the model.
-# Changing it here without re-capturing and re-training breaks the model.
+# The word model is a TEMPORAL model (TCN, 1D convolutions over time) — it
+# reads the ordered sequence of normalized frames, NOT a single mean+std vector.
+# This is the key change over the old model: mean+std is order-blind (it cannot
+# tell "hand goes up then down" from "down then up"), which collapses as the
+# vocabulary grows. Order matters in ASL, so the model must see the sequence.
 #
-#   Raise → analyzes longer gestures. Needed for slow signs or vocabulary
-#           with complex movements.
-#   Lower → faster response but less temporal context. Only useful for very
-#           short signs and a small vocabulary.
+# Recording length varies (a sign can take 0.5-1.5s); both capture and live
+# inference RESAMPLE whatever was recorded to exactly this many frames
+# (src.utils.resample_sequence) so every sample has the same shape (T, 63).
 #
-# Default: 20 frames ~= 0.67s at 30fps.
+# CRITICAL WARNING: this value MUST be identical in capture, training and
+# inference. It is imported everywhere from here — never hardcode it.
+#
+#   Raise → more temporal detail; better for complex/long signs, slower.
+#   Lower → faster, less detail.
+#
+# Default: 32 frames (empirically validated; ~1s of signing resampled to 32).
 
-WORD_SEQ_FRAMES = 20
+WORD_SEQ_LEN = 32
+
+# Max length of the rolling live buffer the classifier keeps while you sign.
+#
+# Every frame with a hand present is appended; once it holds at least
+# WORD_MIN_FRAMES, the buffer is resampled to WORD_SEQ_LEN and classified. A
+# value a bit larger than WORD_SEQ_LEN gives the resampler some slack so a
+# slightly long sign is not clipped.
+#
+# Default: 45 frames ~= 1.5s at 30fps.
+
+WORD_BUFFER_FRAMES = 45
+
+# Minimum frames in the live buffer before the word model runs.
+#
+# Below this there is not enough of a gesture to classify reliably; the
+# classifier returns no word prediction until the buffer fills to here.
+#
+# Default: 16 frames ~= 0.53s at 30fps.
+
+WORD_MIN_FRAMES = 16
 
 # Number of recent frames used ONLY to decide whether the hand is moving
 # right now (does not affect the model features).
@@ -163,11 +189,16 @@ WORD_MIN_MOTION_STD = 0.020
 # word" and None is returned instead of showing it. It must match exactly the
 # name used when capturing the negative-class data and when training.
 #
+# Without this class a closed-set softmax labels EVERYTHING as some word (rest,
+# transitions, moving letters) and never stays silent — the single most common
+# cause of "it's always saying something". Capture plenty of varied non-sign
+# takes for it (capture/capture_words.py rotates prompts to force variety).
+#
 # NOTE: this string is data-bound. It must match a label inside
 # model/labels_words.json. Do not change it without re-capturing data with
-# the new name and re-training.
+# the new name and re-training. (English now, to match the ASL gloss vocabulary.)
 
-WORD_NULL_LABEL = "nada"
+WORD_NULL_LABEL = "nothing"
 
 
 # ================================================================
@@ -274,28 +305,34 @@ LETTER_COOLDOWN_FRAMES = 20
 #  5. CAPTURE — parameters used when recording new word samples
 # ================================================================
 
-# Number of sequences to record per word in capture_words.py.
+# Target number of takes to record per word in capture_words.py.
 #
-#   Raise → more data, better model generalization. Recommended: >=100 for
-#           production, >=50 for quick tests.
-#   Lower → faster capture; useful for test sessions.
+# MORE IMPORTANT THAN THE COUNT: capture across MULTIPLE SESSIONS (different
+# days, lighting, clothing, distance). A model trained on many takes from a
+# SINGLE session memorizes that session, not the sign — it scores high in
+# validation but fails live. 3 sessions x ~15 takes generalizes far better
+# than 45 takes in one sitting. Re-run the script on different days; it appends.
 #
-# Default: 100 sequences per word.
-
-CAPTURE_TARGET_PER_WORD = 100
-
-# Frames per sequence when capturing.
+#   Raise → more data per session. Lower → faster test sessions.
 #
-# CRITICAL WARNING: MUST equal WORD_SEQ_FRAMES. If they differ, the captured
-# features will have a different dimension than the model expects and
-# training will fail.
+# Default: 15 takes per word per run (aim for 3+ runs on different days).
+
+CAPTURE_TARGET_PER_WORD = 15
+
+# Frames the captured sequence is resampled to before saving.
 #
-# It exists separately only for clarity in capture_words.py; internally it
-# points to the same value as WORD_SEQ_FRAMES.
+# CRITICAL WARNING: MUST equal WORD_SEQ_LEN. Capture records a variable-length
+# take, then resamples it to this fixed length so every saved sample is
+# (WORD_SEQ_LEN, 63) — exactly what training and inference expect. Points to
+# the same value as WORD_SEQ_LEN so they can never drift apart.
 
-CAPTURE_SEQ_FRAMES = WORD_SEQ_FRAMES
+CAPTURE_SEQ_LEN = WORD_SEQ_LEN
 
-# Directory where word-capture CSVs are saved.
+# Directory where word-capture sequences (.npy) and the manifest are saved.
+#
+# Each take is one (WORD_SEQ_LEN, 63) array at seq/<gloss>_<n>.npy; manifest.csv
+# records sample_id, gloss and train/val split. This is the .npy sequence format
+# the TCN reads (the old flat-CSV mean+std format was removed with the old model).
 
 CAPTURE_OUTPUT_DIR = "data/real_capture/words"
 
@@ -399,3 +436,34 @@ SPEECH_WHISPER_MODEL = "tiny"
 # improve accuracy when the language is always known in advance.
 
 SPEECH_LANGUAGE = None
+
+
+# ================================================================
+#  10. TRANSLATION — ASL glosses -> fluent sentence (LLM layer)
+# ================================================================
+# This is the second stage of the two-stage design: the recognizer outputs ASL
+# GLOSSES (English keywords, citation form, e.g. "WANT DRINK NOW"); the LLM
+# turns that into a natural sentence ("Quiero tomar algo ahora."). Verb
+# conjugation and tense live HERE, not in the recognizer — ASL does not
+# conjugate verbs, so trying to recognize conjugated forms is both
+# linguistically wrong and combinatorially explosive. See src/translator.py.
+
+# Master switch. When False, no API calls are made; pressing the translate key
+# just joins the glosses as-is (the app still works fully offline).
+
+TRANSLATION_ENABLED = True
+
+# Target language for the fluent sentence (free text, sent to the model).
+
+TRANSLATION_TARGET_LANGUAGE = "Spanish"
+
+# Claude model used for translation. Glosses->sentence is a small, well-scoped
+# task; the default is the most capable model, but any current model works.
+# The API key is read from the ANTHROPIC_API_KEY environment variable.
+
+TRANSLATION_MODEL = "claude-opus-4-8"
+
+# If the API is unreachable (no key, no internet, error), fall back to showing
+# the raw glosses joined by spaces instead of failing. Keeps the demo robust.
+
+TRANSLATION_OFFLINE_FALLBACK = True

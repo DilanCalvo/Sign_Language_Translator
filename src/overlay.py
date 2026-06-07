@@ -175,6 +175,10 @@ class WordBuffer:
     def get_text(self) -> str:
         return " ".join(self._words)
 
+    def get_words(self) -> list:
+        """Return the accumulated glosses (for the LLM translation layer)."""
+        return list(self._words)
+
     def clear(self) -> None:
         self._words.clear()
         self._idle = 0

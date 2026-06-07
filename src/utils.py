@@ -56,6 +56,55 @@ def _normalize_single(flat63):
 
 
 # ---------------------------------------------------------------------------
+# Temporal resampling — single source of truth for capture, training and
+# inference (the same lesson as normalize_landmarks: if they disagree, the
+# model sees different shapes at train vs run time).
+# ---------------------------------------------------------------------------
+
+def resample_sequence(frames, n: int) -> np.ndarray:
+    """
+    Resample a list/array of equal-length frame vectors to exactly `n` frames,
+    evenly spaced over the original timeline.
+
+    A recorded sign has a variable number of frames (it depends on how fast it
+    was signed). The temporal word model needs a fixed length, so every take is
+    resampled to WORD_SEQ_LEN here — at capture time AND at inference time —
+    guaranteeing identical (n, 63) shapes everywhere.
+
+    Args:
+        frames: sequence of (D,) vectors (here D = 63 normalized landmarks).
+        n:      target number of frames.
+
+    Returns:
+        np.ndarray float32 of shape (n, D).
+    """
+    frames = list(frames)
+    if not frames:
+        raise ValueError("Cannot resample an empty sequence.")
+    idx = np.linspace(0, len(frames) - 1, n).round().astype(int)
+    return np.stack([frames[i] for i in idx]).astype(np.float32)
+
+
+def mirror_sequence(seq) -> np.ndarray:
+    """
+    Horizontal mirror of a one-hand landmark sequence: negate every X
+    coordinate. A right-handed sign mirrored looks like the same sign performed
+    left-handed, so this doubles the data for free and makes the model
+    handedness-robust. Used as training augmentation (kept here so training and
+    any future test-time augmentation share one definition).
+
+    Args:
+        seq: array of shape (T, 63).
+
+    Returns:
+        np.ndarray float32 of shape (T, 63) with X coordinates negated.
+    """
+    seq = np.asarray(seq, dtype=np.float32).copy()
+    seq[:, 0::3] *= -1.0   # x is every 3rd value (x, y, z per landmark)
+    return seq
+
+
+# ---------------------------------------------------------------------------
 # Temporal smoothing of predictions
 # ---------------------------------------------------------------------------
 
