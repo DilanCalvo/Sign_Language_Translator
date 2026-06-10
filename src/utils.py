@@ -56,6 +56,100 @@ def _normalize_single(flat63):
 
 
 # ---------------------------------------------------------------------------
+# Word feature builder — body-anchored, two-hand. SINGLE SOURCE OF TRUTH for the
+# word pipeline (capture, training and inference must all build features here,
+# the same lesson as normalize_landmarks). See config.WORD_FEATURE_DIM for the
+# layout. Letters do NOT use this — they keep the plain one-hand normalize.
+# ---------------------------------------------------------------------------
+
+_HAND_SHAPE_LEN = 63          # 21 landmarks x (x, y, z)
+_HAND_BLOCK_LEN = 65          # shape (63) + wrist position (x, y)
+WORD_FEATURE_LEN = 130        # left block (65) + right block (65)
+
+
+def _hand_block(hand_flat, frame):
+    """
+    Build one hand's 65-value block: 63 handshape + 2 body-relative wrist pos.
+
+    hand_flat: list/array of 63 raw image-normalized landmarks, or None.
+    frame: (cx, cy, scale) body frame, or None when pose was not detected.
+
+    A missing hand returns zeros — a distinct pattern the model reads as absent.
+    When there is no body frame, the position part is 0 (NOT the raw screen
+    coordinate): without an anchor we have no position signal, and leaking the
+    absolute on-screen position would reintroduce exactly the distractor the
+    body anchor exists to remove.
+    """
+    if hand_flat is None:
+        return np.zeros(_HAND_BLOCK_LEN, dtype=np.float32)
+    arr = np.asarray(hand_flat, dtype=np.float32)
+    shape = _normalize_single(arr)                 # 63, wrist-centered + scaled
+    if frame is None:
+        pos_x = pos_y = 0.0
+    else:
+        cx, cy, scale = frame
+        wrist = arr.reshape(21, 3)[_WRIST]         # raw wrist x, y, z
+        pos_x = (wrist[0] - cx) / scale
+        pos_y = (wrist[1] - cy) / scale
+    return np.concatenate([shape, [pos_x, pos_y]]).astype(np.float32)
+
+
+def build_word_features(left_hand, right_hand, shoulder_l, shoulder_r):
+    """
+    Build the full (WORD_FEATURE_LEN,) word feature vector for one frame.
+
+    Args:
+        left_hand, right_hand: 63-value raw landmark lists, or None if that hand
+            is not present. Slots are by MediaPipe handedness so the same sign
+            always lands in the same slot.
+        shoulder_l, shoulder_r: (x, y) of the left/right shoulder, or None if
+            pose was not detected (then there is no body anchor: the wrist
+            position is 0, the handshape still works).
+
+    Returns:
+        np.ndarray float32 of shape (WORD_FEATURE_LEN,).
+    """
+    frame = None
+    if shoulder_l is not None and shoulder_r is not None:
+        cx = (shoulder_l[0] + shoulder_r[0]) * 0.5
+        cy = (shoulder_l[1] + shoulder_r[1]) * 0.5
+        scale = float(np.hypot(shoulder_l[0] - shoulder_r[0],
+                               shoulder_l[1] - shoulder_r[1]))
+        if scale < 1e-6:
+            scale = 1.0
+        frame = (cx, cy, scale)
+
+    return np.concatenate([
+        _hand_block(left_hand,  frame),
+        _hand_block(right_hand, frame),
+    ]).astype(np.float32)
+
+
+def mirror_word_sequence(seq) -> np.ndarray:
+    """
+    Horizontal mirror of a word-feature sequence (T, WORD_FEATURE_LEN).
+
+    Mirroring a sign swaps left/right: a right-handed sign becomes the same sign
+    performed left-handed. So we (1) negate every x coordinate and (2) swap the
+    two hand blocks. Used as training augmentation — doubles the data and makes
+    the model handedness-robust.
+    """
+    seq = np.asarray(seq, dtype=np.float32)
+    left  = _mirror_hand_block(seq[:, :_HAND_BLOCK_LEN])
+    right = _mirror_hand_block(seq[:, _HAND_BLOCK_LEN:])
+    # Swap: mirrored-left becomes the right hand and vice versa.
+    return np.concatenate([right, left], axis=1).astype(np.float32)
+
+
+def _mirror_hand_block(block):
+    """Negate x of the handshape (every 3rd value) and of the wrist position."""
+    b = np.asarray(block, dtype=np.float32).copy()
+    b[:, 0:_HAND_SHAPE_LEN:3] *= -1.0   # x of each of the 21 shape landmarks
+    b[:, _HAND_SHAPE_LEN] *= -1.0       # wrist position x (index 63)
+    return b
+
+
+# ---------------------------------------------------------------------------
 # Temporal resampling — single source of truth for capture, training and
 # inference (the same lesson as normalize_landmarks: if they disagree, the
 # model sees different shapes at train vs run time).
@@ -69,10 +163,10 @@ def resample_sequence(frames, n: int) -> np.ndarray:
     A recorded sign has a variable number of frames (it depends on how fast it
     was signed). The temporal word model needs a fixed length, so every take is
     resampled to WORD_SEQ_LEN here — at capture time AND at inference time —
-    guaranteeing identical (n, 63) shapes everywhere.
+    guaranteeing identical (n, D) shapes everywhere.
 
     Args:
-        frames: sequence of (D,) vectors (here D = 63 normalized landmarks).
+        frames: sequence of (D,) vectors (here D = WORD_FEATURE_DIM word features).
         n:      target number of frames.
 
     Returns:

@@ -1,0 +1,53 @@
+{
+  "timestamp": "20260609_215315",
+  "git_sha": "040affa",
+  "vocab": [
+    "drink",
+    "eat",
+    "finished",
+    "good",
+    "hello",
+    "help",
+    "me",
+    "more",
+    "need",
+    "no",
+    "nothing",
+    "please",
+    "sorry",
+    "thanks",
+    "want",
+    "yes",
+    "you"
+  ],
+  "n_classes": 17,
+  "n_sessions": 2,
+  "n_samples": 466,
+  "samples_per_class": {
+    "drink": 27,
+    "eat": 27,
+    "finished": 27,
+    "good": 27,
+    "hello": 27,
+    "help": 27,
+    "me": 7,
+    "more": 27,
+    "need": 27,
+    "no": 27,
+    "nothing": 54,
+    "please": 27,
+    "sorry": 27,
+    "thanks": 27,
+    "want": 27,
+    "yes": 27,
+    "you": 27
+  },
+  "val_accuracy": 0.8824,
+  "config": {
+    "WORD_SEQ_LEN": 32,
+    "WORD_FEATURE_DIM": 130,
+    "epochs": 200,
+    "batch_size": 16,
+    "lr": 0.001
+  }
+}

@@ -1,10 +1,22 @@
+import time
+
 import cv2
+
+# Load variables from a local .env (e.g. ANTHROPIC_API_KEY for the translation
+# layer) into the environment BEFORE the modules that read them. Optional and
+# silent: if python-dotenv is not installed or there is no .env, the app still
+# runs and the translator simply stays in offline/fallback mode.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from config import (
     MODE,
     LETTER_SMOOTH_WINDOW, LETTER_SMOOTH_MIN_VOTES,
     WORD_SMOOTH_WINDOW, WORD_SMOOTH_MIN_VOTES,
-    WORD_COOLDOWN_FRAMES,
+    WORD_COOLDOWN_SECONDS,
     MOTION_LETTERS,
     LOW_CONFIDENCE_THRESHOLD,
     VOICE_ENABLED,
@@ -39,6 +51,43 @@ _MODE_LABELS = {
     "words":   "WORDS",
     "numbers": "NUMBERS",
 }
+
+
+class WordCommitFSM:
+    """Vote -> confirm -> lock-out state machine for dynamic word signs.
+
+    Owns the word smoother and the cooldown clock so the main loop holds no
+    loose word state. step() returns (word, confidence, is_new): is_new is True
+    only on the frame a fresh sign is committed (the moment to speak/log it).
+    During the cooldown the last committed word stays on screen and no new word
+    is accepted.
+    """
+
+    def __init__(self, smoother, cooldown_seconds):
+        self._smoother = smoother
+        self._cooldown = cooldown_seconds
+        self.reset()
+
+    def reset(self):
+        self._smoother.reset()
+        self._locked = None
+        self._locked_conf = 0.0
+        self._cooldown_until = 0.0
+
+    def step(self, word_pred, now):
+        if now < self._cooldown_until:
+            self._smoother.reset()
+            return self._locked, self._locked_conf, False
+
+        self._locked = None
+        self._smoother.update(word_pred["prediction"] if word_pred is not None else None)
+        stable = self._smoother.get_stable()
+        if stable is not None:
+            self._locked = stable
+            self._locked_conf = word_pred["confidence"] if word_pred is not None else 0.0
+            self._cooldown_until = now + self._cooldown
+            return stable, self._locked_conf, True
+        return None, 0.0, False
 
 
 def _draw_confidence_bar(frame, x, y, width, confidence):
@@ -237,7 +286,10 @@ def main():
     detector      = Detector()
     classifier    = Classifier()
     smoother      = PredictionSmoother(window=LETTER_SMOOTH_WINDOW, min_votes=LETTER_SMOOTH_MIN_VOTES)
-    word_smoother = PredictionSmoother(window=WORD_SMOOTH_WINDOW, min_votes=WORD_SMOOTH_MIN_VOTES)
+    word_fsm      = WordCommitFSM(
+        PredictionSmoother(window=WORD_SMOOTH_WINDOW, min_votes=WORD_SMOOTH_MIN_VOTES),
+        WORD_COOLDOWN_SECONDS,
+    )
     letter_buffer = LetterBuffer()
     word_buffer   = WordBuffer()
     speech_buffer = SpeechBuffer()
@@ -257,11 +309,6 @@ def main():
         enabled=TRANSLATION_ENABLED,
         offline_fallback=TRANSLATION_OFFLINE_FALLBACK,
     )
-
-    # Word cooldown state.
-    locked_word      = None
-    locked_word_conf = 0.0
-    cooldown_frames  = 0
 
     # Translation display state (the LLM-produced sentence + its status).
     translation_text   = ""
@@ -307,22 +354,8 @@ def main():
 
         # ----- Words with cooldown (active only in "words" mode) -----
         if mode == "words":
-            word_raw          = raw_result["word_prediction"]
-            new_word_detected = False
-            if cooldown_frames > 0:
-                cooldown_frames -= 1
-                word_smoother.reset()
-                stable_word = locked_word
-                if cooldown_frames == 0:
-                    locked_word = None
-            else:
-                word_smoother.update(word_raw["prediction"] if word_raw is not None else None)
-                stable_word = word_smoother.get_stable()
-                if stable_word is not None:
-                    locked_word       = stable_word
-                    locked_word_conf  = word_raw["confidence"] if word_raw is not None else 0.0
-                    cooldown_frames   = WORD_COOLDOWN_FRAMES
-                    new_word_detected = True
+            stable_word, word_conf, new_word_detected = word_fsm.step(
+                raw_result["word_prediction"], time.time())
             if new_word_detected:
                 # Add the sign to the running sentence and speak/log it.
                 spoken = word_buffer.add(stable_word)
@@ -332,10 +365,9 @@ def main():
                     conv_log.add_sign(spoken)
             word_buffer.tick()
         else:
-            word_smoother.reset()
+            word_fsm.reset()
             stable_word = None
-
-        word_conf = locked_word_conf if stable_word is not None else 0.0
+            word_conf = 0.0
 
         # In "words" mode always suppress the raw letter display.
         effective_signing = hand_is_signing or (mode == "words")
@@ -383,39 +415,12 @@ def main():
         if key == ord('q'):
             break
 
-        elif key == ord('l'):
-            mode = "letters"
+        elif key in (ord('l'), ord('w'), ord('n')):
+            mode = {ord('l'): "letters", ord('w'): "words", ord('n'): "numbers"}[key]
             smoother.reset()
-            word_smoother.reset()
+            word_fsm.reset()
             letter_buffer.clear()
             word_buffer.clear()
-            locked_word        = None
-            locked_word_conf   = 0.0
-            cooldown_frames    = 0
-            translation_text   = ""
-            translation_status = ""
-
-        elif key == ord('w'):
-            mode = "words"
-            smoother.reset()
-            word_smoother.reset()
-            letter_buffer.clear()
-            word_buffer.clear()
-            locked_word        = None
-            locked_word_conf   = 0.0
-            cooldown_frames    = 0
-            translation_text   = ""
-            translation_status = ""
-
-        elif key == ord('n'):
-            mode = "numbers"
-            smoother.reset()
-            word_smoother.reset()
-            letter_buffer.clear()
-            word_buffer.clear()
-            locked_word        = None
-            locked_word_conf   = 0.0
-            cooldown_frames    = 0
             translation_text   = ""
             translation_status = ""
 

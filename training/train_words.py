@@ -1,11 +1,13 @@
 """
 Word / moving-sign model training — temporal sequence model (TCN).
 
-Each sample is a (WORD_SEQ_LEN, 63) sequence of normalized one-hand landmarks
-captured by capture/capture_words.py. Unlike the old mean+std model (which was
-order-blind and collapsed as the vocabulary grew), this is a TEMPORAL model:
-stacked dilated 1D convolutions read the movement OVER TIME, so it can tell
-similar signs apart by HOW the hand moves, not just the average pose.
+Each sample is a (WORD_SEQ_LEN, WORD_FEATURE_DIM) sequence of body-anchored,
+two-hand features captured by capture/capture_words.py (see config for the
+layout: both handshapes + each wrist's position relative to the shoulders).
+Unlike the old mean+std model (which was order-blind and collapsed as the
+vocabulary grew), this is a TEMPORAL model: stacked dilated 1D convolutions read
+the movement OVER TIME, so it can tell similar signs apart by HOW the hands move
+and WHERE they are on the body, not just the average pose.
 
 The architecture (Conv1D + global pooling, ~80K params) was validated earlier on
 sequence data and is trained from scratch on your own captures — no external
@@ -28,26 +30,28 @@ Usage:
 import csv
 import json
 import os
+import subprocess
 import sys
+from collections import Counter
+from datetime import datetime
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     WORD_SEQ_LEN       as T,
+    WORD_FEATURE_DIM   as FEATURE_DIM,
     CAPTURE_OUTPUT_DIR as _DATA_DIR,
     MODEL_WORDS_PATH   as MODEL_OUT,
     LABELS_WORDS_PATH  as LABELS_OUT,
 )
-from src.utils import mirror_sequence
+from src.utils import mirror_word_sequence
 
 HERE     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(HERE, _DATA_DIR)
 SEQ_DIR  = os.path.join(DATA_DIR, "seq")
 MANIFEST = os.path.join(DATA_DIR, "manifest.csv")
 
-FEATURE_DIM = 63          # one hand: 21 landmarks x (x, y, z)
-NPTS        = FEATURE_DIM // 3
 BATCH_SIZE  = 16
 EPOCHS      = 200
 LR          = 1e-3
@@ -55,11 +59,24 @@ NOISE_STD   = 0.02
 SEED        = 42
 
 
-def _load_split(rows, subset, label_to_idx):
-    X, y = [], []
+def load_manifest():
+    """Read the manifest and the sorted class list. Shared by train + evaluate."""
+    rows = list(csv.DictReader(open(MANIFEST, encoding="utf-8")))
+    glosses = sorted({r["gloss"] for r in rows})
+    label_to_idx = {g: i for i, g in enumerate(glosses)}
+    return rows, glosses, label_to_idx
+
+
+def load_samples(rows, label_to_idx):
+    """Load (X, y, groups) for ALL takes in the manifest.
+
+    groups holds each take's session_id (the capture run it came from). It is
+    what makes validation honest: whole sessions are held out instead of random
+    takes, so the model is never validated against the same day/lighting it
+    trained on. Takes written before session_id existed are tagged "legacy".
+    """
+    X, y, groups = [], [], []
     for r in rows:
-        if r["subset"] != subset:
-            continue
         path = os.path.join(SEQ_DIR, f"{r['sample_id']}.npy")
         if not os.path.isfile(path):
             continue
@@ -70,10 +87,44 @@ def _load_split(rows, subset, label_to_idx):
             continue
         X.append(seq)
         y.append(label_to_idx[r["gloss"]])
+        groups.append(r.get("session_id") or "legacy")
     if not X:
         return (np.empty((0, T, FEATURE_DIM), np.float32),
-                np.empty((0,), np.int64))
-    return np.stack(X).astype(np.float32), np.array(y, np.int64)
+                np.empty((0,), np.int64), np.empty((0,), object))
+    return (np.stack(X).astype(np.float32),
+            np.array(y, np.int64),
+            np.array(groups, dtype=object))
+
+
+def session_holdout(y, groups, val_fraction=0.2, seed=SEED):
+    """Train/val indices that hold WHOLE sessions out for validation.
+
+    Whole capture sessions go to validation (never split within a session) so
+    there is no train/val leakage. Returns an empty val set when fewer than two
+    sessions exist: an honest holdout is then impossible, so the caller trains on
+    everything and reports that the metric would be optimistic.
+    """
+    groups = np.asarray(groups, dtype=object)
+    sessions = sorted(set(groups.tolist()))
+    if len(sessions) < 2:
+        return np.arange(len(y)), np.empty((0,), dtype=int)
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(sessions)
+    val_sessions, n_val, target = set(), 0, val_fraction * len(y)
+    for s in sessions:
+        if n_val >= target:
+            break
+        val_sessions.add(s)
+        n_val += int(np.sum(groups == s))
+    if len(val_sessions) == len(sessions):       # never leave train empty
+        val_sessions.discard(sessions[-1])
+
+    val_mask = np.array([g in val_sessions for g in groups])
+    return np.where(~val_mask)[0], np.where(val_mask)[0]
+
+
+_HAND_BLOCK = FEATURE_DIM // 2   # 65: one hand's [63 shape + 2 position] block
 
 
 def _time_warp(seq, gamma):
@@ -84,16 +135,106 @@ def _time_warp(seq, gamma):
     return seq[idx]
 
 
+def _frame_dropout(seq, p, rng):
+    """Zero whole frames at random. MediaPipe intermittently loses the hands in
+    live use; an all-zero frame is exactly the 'hands absent' pattern the feature
+    builder emits, so this teaches the model to ride through dropped frames
+    instead of treating clean capture as the only reality."""
+    out = seq.copy()
+    out[rng.random(len(seq)) < p] = 0.0
+    return out
+
+
+def _hand_dropout(seq, rng):
+    """Zero one hand's block over a contiguous span — a hand briefly leaving the
+    frame. Span-limited (20-50% of the take, not all of it) so the sign's
+    identity survives on two-handed signs while still teaching single-hand
+    robustness, the other common live detection failure."""
+    out = seq.copy()
+    side = rng.integers(2)                       # 0 = left block, 1 = right block
+    lo = side * _HAND_BLOCK
+    span = max(1, int(len(seq) * rng.uniform(0.2, 0.5)))
+    start = rng.integers(0, len(seq) - span + 1)
+    out[start:start + span, lo:lo + _HAND_BLOCK] = 0.0
+    return out
+
+
 def _offline_augment(X, y):
-    """Mirror + time-warp variants, applied once before training to enlarge the
-    tiny dataset. (Per-batch jitter is added separately in the tf pipeline.)"""
-    variants = [X, np.stack([mirror_sequence(s) for s in X])]
+    """Enlarge the tiny dataset with structural variants applied once before
+    training: mirror, time-warp (pace) and detector-failure (dropped frames /
+    a hand leaving the frame). Per-batch jitter is added separately in tf.data."""
+    rng = np.random.default_rng(SEED)
+    variants = [X, np.stack([mirror_word_sequence(s) for s in X])]
     for g in (0.7, 1.4):
         variants.append(np.stack([_time_warp(s, g) for s in X]))
-        variants.append(np.stack([_time_warp(mirror_sequence(s), g) for s in X]))
+        variants.append(np.stack([_time_warp(mirror_word_sequence(s), g) for s in X]))
+    variants.append(np.stack([_frame_dropout(s, 0.10, rng) for s in X]))
+    variants.append(np.stack([_hand_dropout(s, rng) for s in X]))
     Xa = np.concatenate(variants).astype(np.float32)
     ya = np.concatenate([y] * len(variants))
     return Xa, ya
+
+
+def _make_train_dataset(X, y, tf):
+    """tf.data pipeline with per-batch jitter (global scale + gaussian noise).
+
+    Layout-agnostic on purpose: the word feature mixes 3-value landmark triples
+    with 2-value position tails, so a per-landmark rotation does not apply
+    cleanly. Mirror + time-warp (offline) handle the structural variety;
+    multi-session capture provides the real-world variety."""
+    def _jitter(x, yy):
+        x = x * tf.random.uniform((), 0.9, 1.1)
+        x = x + tf.random.normal(tf.shape(x), stddev=NOISE_STD)
+        return x, yy
+
+    return (tf.data.Dataset.from_tensor_slices((X, y))
+            .shuffle(len(X), seed=SEED, reshuffle_each_iteration=True)
+            .map(_jitter, num_parallel_calls=tf.data.AUTOTUNE)
+            .batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE))
+
+
+def train_model(Xtr, ytr, Xva, yva, num_classes, epochs=EPOCHS,
+                verbose=2, summary=False):
+    """
+    Train one TCN on the given (un-augmented) arrays and return the fitted model.
+
+    Offline augmentation + per-batch jitter + class weighting are applied
+    internally, so training/main and evaluation/cross-validation share ONE
+    definition of "how a word model is trained" (no architecture drift).
+    """
+    import tensorflow as tf
+    from tensorflow.keras import callbacks
+    from sklearn.utils.class_weight import compute_class_weight
+
+    Xtr, ytr = _offline_augment(Xtr, ytr)
+    # Weight only the classes actually present in this train split. A class can be
+    # absent when its only session is the held-out one (session-grouped CV/holdout
+    # of a class that was captured in a single session); absent classes get a
+    # neutral weight so Keras never looks up a missing key.
+    present = np.unique(ytr)
+    weights = compute_class_weight("balanced", classes=present, y=ytr)
+    class_weight = {int(c): float(w) for c, w in zip(present, weights)}
+    for c in range(num_classes):
+        class_weight.setdefault(c, 1.0)
+
+    train_ds = _make_train_dataset(Xtr, ytr, tf)
+    val_ds = (tf.data.Dataset.from_tensor_slices((Xva, yva)).batch(BATCH_SIZE)
+              if len(Xva) else None)
+
+    model = _build_model(num_classes)
+    if summary:
+        model.summary()
+
+    monitor = "val_accuracy" if val_ds else "accuracy"
+    cb = [
+        callbacks.EarlyStopping(monitor=monitor, mode="max", patience=30,
+                                restore_best_weights=True, verbose=0),
+        callbacks.ReduceLROnPlateau(monitor=monitor, mode="max", factor=0.6,
+                                    patience=10, min_lr=1e-6, verbose=0),
+    ]
+    model.fit(train_ds, validation_data=val_ds, epochs=epochs,
+              callbacks=cb, class_weight=class_weight, verbose=verbose)
+    return model
 
 
 def _build_model(num_classes):
@@ -123,10 +264,48 @@ def _build_model(num_classes):
     return model
 
 
+def _git_sha():
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=HERE,
+            capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def _write_run_metadata(glosses, groups, y, val_acc):
+    """Append a one-file record of this training run so model iterations are
+    comparable (which vocab, how many sessions, what accuracy, which config).
+    Lightweight on purpose: one JSON per run under runs/, version it in git."""
+    runs_dir = os.path.join(HERE, "runs")
+    os.makedirs(runs_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    per_class = Counter(glosses[i] for i in y)
+    record = {
+        "timestamp": stamp,
+        "git_sha": _git_sha(),
+        "vocab": glosses,
+        "n_classes": len(glosses),
+        "n_sessions": len(set(groups.tolist())),
+        "n_samples": int(len(y)),
+        "samples_per_class": dict(sorted(per_class.items())),
+        "val_accuracy": round(float(val_acc), 4) if val_acc is not None else None,
+        "config": {
+            "WORD_SEQ_LEN": T,
+            "WORD_FEATURE_DIM": FEATURE_DIM,
+            "epochs": EPOCHS,
+            "batch_size": BATCH_SIZE,
+            "lr": LR,
+        },
+    }
+    path = os.path.join(runs_dir, f"{stamp}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False)
+    print(f"Run    -> runs/{stamp}.json")
+
+
 def main():
     import tensorflow as tf
-    from tensorflow.keras import callbacks
-    from sklearn.utils.class_weight import compute_class_weight
 
     np.random.seed(SEED)
     tf.random.set_seed(SEED)
@@ -136,74 +315,49 @@ def main():
         print("  Capture data first: python capture/capture_words.py")
         sys.exit(1)
 
-    rows = list(csv.DictReader(open(MANIFEST, encoding="utf-8")))
-    glosses = sorted({r["gloss"] for r in rows})
-    label_to_idx = {g: i for i, g in enumerate(glosses)}
+    rows, glosses, label_to_idx = load_manifest()
     num_classes = len(glosses)
     if num_classes < 2:
         print(f"[ERROR] Only {num_classes} class captured. Need at least 2.")
         sys.exit(1)
 
-    Xtr, ytr = _load_split(rows, "train", label_to_idx)
-    Xva, yva = _load_split(rows, "val", label_to_idx)
-    print(f"Vocabulary ({num_classes}): {', '.join(glosses)}")
-    print(f"  train {len(Xtr)}  val {len(Xva)}")
-    if len(Xtr) < num_classes * 5:
-        print("  [WARN] Few takes per word. Capture more — ideally across several "
-              "sessions (different days/lighting) so the model generalizes.")
-    if len(Xtr) == 0:
+    X, y, groups = load_samples(rows, label_to_idx)
+    if len(X) == 0:
         print("[ERROR] No training samples loaded.")
         sys.exit(1)
 
-    Xtr, ytr = _offline_augment(Xtr, ytr)
-    print(f"  train after offline augmentation: {len(Xtr)}")
+    n_sessions = len(set(groups.tolist()))
+    tr_idx, va_idx = session_holdout(y, groups)
+    Xtr, ytr = X[tr_idx], y[tr_idx]
+    Xva, yva = X[va_idx], y[va_idx]
 
-    weights = compute_class_weight("balanced", classes=np.arange(num_classes), y=ytr)
-    class_weight = {i: float(w) for i, w in enumerate(weights)}
+    print(f"Vocabulary ({num_classes}): {', '.join(glosses)}")
+    print(f"  sessions {n_sessions}  train {len(Xtr)}  val {len(Xva)}  "
+          "(x6 after offline augmentation)")
+    if n_sessions < 2:
+        print("  [WARN] Only one capture session, so validation is empty: holding "
+              "out whole sessions is the only leak-free split, and there is no "
+              "second session to hold out. Train accuracy alone is optimistic — "
+              "capture another session (different day/lighting) for an honest read.")
+    if len(Xtr) < num_classes * 5:
+        print("  [WARN] Few takes per word. Capture more — ideally across several "
+              "sessions (different days/lighting) so the model generalizes.")
+    if "nothing" not in glosses:
+        print("  [WARN] No 'nothing' (negative) class found. Without it the model "
+              "is forced to label every frame as some word and never stays silent. "
+              "Capture it with capture/capture_words.py.")
 
-    def _jitter(x, y):
-        """Per-batch augmentation: small scale, 2D rotation, joint dropout, noise."""
-        x = x * tf.random.uniform((), 0.9, 1.1)
-        th = tf.random.uniform((), -0.20, 0.20)
-        pts = tf.reshape(x, (T, NPTS, 3))
-        px, py, pz = pts[..., 0], pts[..., 1], pts[..., 2]
-        c, s = tf.cos(th), tf.sin(th)
-        pts = tf.stack([px * c - py * s, px * s + py * c, pz], axis=-1)
-        keep = tf.cast(tf.random.uniform((T, NPTS, 1)) > 0.07, tf.float32)
-        x = tf.reshape(pts * keep, (T, FEATURE_DIM))
-        x = x + tf.random.normal(tf.shape(x), stddev=NOISE_STD)
-        return x, y
-
-    train_ds = (tf.data.Dataset.from_tensor_slices((Xtr, ytr))
-                .shuffle(len(Xtr), seed=SEED, reshuffle_each_iteration=True)
-                .map(_jitter, num_parallel_calls=tf.data.AUTOTUNE)
-                .batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE))
-    val_ds = (tf.data.Dataset.from_tensor_slices((Xva, yva)).batch(BATCH_SIZE)
-              if len(Xva) else None)
-
-    print("\nBuilding model...")
-    model = _build_model(num_classes)
-    model.summary()
-
-    monitor = "val_accuracy" if val_ds else "accuracy"
-    cb = [
-        callbacks.EarlyStopping(monitor=monitor, mode="max", patience=30,
-                                restore_best_weights=True, verbose=1),
-        callbacks.ReduceLROnPlateau(monitor=monitor, mode="max", factor=0.6,
-                                    patience=10, min_lr=1e-6, verbose=1),
-    ]
-
-    print("\nTraining...\n")
-    model.fit(train_ds, validation_data=val_ds, epochs=EPOCHS,
-              callbacks=cb, class_weight=class_weight, verbose=2)
+    print("\nBuilding + training model...\n")
+    model = train_model(Xtr, ytr, Xva, yva, num_classes, summary=True)
 
     print("\n" + "=" * 60)
-    if val_ds is not None and len(Xva):
-        loss, acc = model.evaluate(Xva, yva, verbose=0)
-        print(f"  val accuracy: {acc * 100:.1f}%  (n={len(Xva)})")
-        print("  NOTE: if all val takes come from the SAME session as train,")
-        print("        this number is optimistic. Real precision needs val takes")
-        print("        captured on a DIFFERENT day.")
+    val_acc = None
+    if len(Xva):
+        _, val_acc = model.evaluate(Xva, yva, verbose=0)
+        print(f"  val accuracy: {val_acc * 100:.1f}%  (n={len(Xva)}, held-out sessions)")
+        print("        Val takes come from sessions the model never trained on, so")
+        print("        this reflects live performance. For a per-class breakdown")
+        print("        run: python training/evaluate.py --cv 5")
     print("=" * 60)
 
     os.makedirs(os.path.dirname(os.path.join(HERE, MODEL_OUT)), exist_ok=True)
@@ -211,6 +365,7 @@ def main():
     with open(os.path.join(HERE, LABELS_OUT), "w", encoding="utf-8") as f:
         json.dump({str(i): g for g, i in label_to_idx.items()},
                   f, indent=2, ensure_ascii=False)
+    _write_run_metadata(glosses, groups, y, val_acc)
 
     print(f"Model  -> {MODEL_OUT}")
     print(f"Labels -> {LABELS_OUT}")

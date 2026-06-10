@@ -41,13 +41,19 @@ There are two models:
 | Model | Input | Detects |
 |---|---|---|
 | **Letters** (`model_one_hand.h5`) | 63 landmark values (one frame) | Static ASL letters |
-| **Words** (`model_words.h5`) | a sequence of 32 frames × 63 values | Dynamic signs / whole words |
+| **Words** (`model_words.h5`) | a sequence of 32 frames × 130 body-anchored values | Dynamic signs / whole words |
 
 The words model is a **temporal sequence model** (a TCN — stacked 1-D
-convolutions over time). It reads the *ordered* movement of the hand, so it can
-tell signs apart by *how* the hand moves, not just the average pose. This is the
+convolutions over time). It reads the *ordered* movement of the hands, so it can
+tell signs apart by *how* the hands move, not just the average pose. This is the
 key to scaling the vocabulary: a movement summary that ignores order collapses
 once two signs share a similar average shape.
+
+Each frame holds **both hands** (handshape) plus **where each hand is relative
+to the shoulders** (a body anchor, via MediaPipe pose). That lets the model
+separate signs with the same handshape at different body locations (hand at the
+chest vs. the forehead) and signs that genuinely use two hands. Letters stay
+one-hand and are unaffected.
 
 ### Two-stage design: recognize, then translate
 

@@ -1,3 +1,4 @@
+import os
 import time
 import cv2
 import mediapipe as mp
@@ -7,15 +8,24 @@ from mediapipe.tasks.python.vision.hand_landmarker import (
     HandLandmarkerOptions,
     HandLandmarksConnections,
 )
+from mediapipe.tasks.python.vision.pose_landmarker import (
+    PoseLandmarker,
+    PoseLandmarkerOptions,
+)
 from mediapipe.tasks.python.vision.core.vision_task_running_mode import VisionTaskRunningMode
 
 from config import (
     HAND_LANDMARKER_PATH              as _LANDMARKER_PATH,
+    POSE_LANDMARKER_PATH              as _POSE_PATH,
     CAMERA_INDEX                      as _DEFAULT_CAMERA,
     DETECTOR_MIN_DETECTION_CONFIDENCE as _DEFAULT_DETECTION,
     DETECTOR_MIN_PRESENCE_CONFIDENCE  as _DEFAULT_PRESENCE,
     DETECTOR_MIN_TRACKING_CONFIDENCE  as _DEFAULT_TRACKING,
 )
+
+# MediaPipe pose landmark indices we anchor the hands to.
+_POSE_LEFT_SHOULDER  = 11
+_POSE_RIGHT_SHOULDER = 12
 
 # BGR drawing colors
 _COLOR_LANDMARK = (0, 217, 255)
@@ -44,6 +54,24 @@ class Detector:
         self._landmarker = HandLandmarker.create_from_options(options)
         self._connections = list(HandLandmarksConnections.HAND_CONNECTIONS)
 
+        # Pose landmarker — only used by the word pipeline (anchors hands to the
+        # body). Optional: if the model file is missing, letters/numbers still
+        # work and the word features just lose the body anchor (position -> 0).
+        self._pose = None
+        if os.path.isfile(_POSE_PATH):
+            pose_options = PoseLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=_POSE_PATH),
+                running_mode=VisionTaskRunningMode.VIDEO,
+                num_poses=1,
+            )
+            self._pose = PoseLandmarker.create_from_options(pose_options)
+        else:
+            print(
+                f"  [WARN] Pose model not found: {_POSE_PATH}\n"
+                "         Word signs will be captured/recognized WITHOUT the body "
+                "anchor (handshape only). Letters are unaffected."
+            )
+
         self._cap = cv2.VideoCapture(camera_index)
         if not self._cap.isOpened():
             raise RuntimeError(f"Could not open the camera (index {camera_index}).")
@@ -58,8 +86,11 @@ class Detector:
             frame (np.ndarray | None): BGR image with landmarks drawn on it.
             landmarks_data (dict): {
                 "num_hands": int,
-                "landmarks_hand1": list[float] | None,  # 63 values (21 x,y,z)
-                "landmarks_hand2": list[float] | None,
+                "landmarks_hand1": list[float] | None,  # 63 values (21 x,y,z),
+                "landmarks_hand2": list[float] | None,  #   detection order (letters)
+                "hands_by_side": {"Left": list|None, "Right": list|None},  # words
+                "shoulder_l": (x, y) | None,            # body anchor (words)
+                "shoulder_r": (x, y) | None,
             }
         """
         ret, frame = self._cap.read()
@@ -71,28 +102,50 @@ class Detector:
         timestamp_ms = int((time.time() - self._start_time) * 1000)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         result = self._landmarker.detect_for_video(mp_image, timestamp_ms)
+        pose_result = self._pose.detect_for_video(mp_image, timestamp_ms) if self._pose else None
 
-        landmarks_data = self._extract_landmarks(result)
+        landmarks_data = self._extract_landmarks(result, pose_result)
         self._draw_landmarks(frame, result)
+        self._draw_pose(frame, landmarks_data)
 
         return frame, landmarks_data
 
-    def _extract_landmarks(self, result):
+    def _extract_landmarks(self, result, pose_result=None):
         data = self._empty_result()
+
+        # ---- Pose: shoulders (body anchor for the word pipeline) ----
+        if pose_result and pose_result.pose_landmarks:
+            pose = pose_result.pose_landmarks[0]
+            ls = pose[_POSE_LEFT_SHOULDER]
+            rs = pose[_POSE_RIGHT_SHOULDER]
+            data["shoulder_l"] = (ls.x, ls.y)
+            data["shoulder_r"] = (rs.x, rs.y)
 
         if not result.hand_landmarks:
             return data
 
         data["num_hands"] = len(result.hand_landmarks)
 
+        # Handedness labels run parallel to hand_landmarks (may be empty).
+        handedness = getattr(result, "handedness", None) or []
+
         for i, hand in enumerate(result.hand_landmarks):
             flat = []
             for lm in hand:
                 flat.extend([lm.x, lm.y, lm.z])
+
+            # Detection-order slots — used by the letter pipeline (unchanged).
             if i == 0:
                 data["landmarks_hand1"] = flat
             elif i == 1:
                 data["landmarks_hand2"] = flat
+
+            # Handedness slots — used by the word pipeline so the same sign
+            # always lands in the same slot regardless of detection order.
+            if i < len(handedness) and handedness[i]:
+                side = handedness[i][0].category_name  # "Left" / "Right"
+                if side in data["hands_by_side"]:
+                    data["hands_by_side"][side] = flat
 
         return data
 
@@ -112,14 +165,32 @@ class Detector:
                 cv2.circle(frame, pt, 5, _COLOR_LANDMARK, -1, cv2.LINE_AA)
                 cv2.circle(frame, pt, 5, (0, 0, 0), 1, cv2.LINE_AA)
 
+    def _draw_pose(self, frame, landmarks_data):
+        """Draw the two shoulder anchors so the user knows the body is tracked."""
+        h, w = frame.shape[:2]
+        for key in ("shoulder_l", "shoulder_r"):
+            pt = landmarks_data.get(key)
+            if pt is not None:
+                cv2.circle(frame, (int(pt[0] * w), int(pt[1] * h)), 6,
+                           (255, 120, 0), -1, cv2.LINE_AA)
+
     def _draw_hud(self, frame, landmarks_data):
         num = landmarks_data["num_hands"]
         color = _COLOR_OK if num > 0 else _COLOR_NONE
         cv2.putText(frame, f"Hands: {num}", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
 
     def _empty_result(self):
-        return {"num_hands": 0, "landmarks_hand1": None, "landmarks_hand2": None}
+        return {
+            "num_hands": 0,
+            "landmarks_hand1": None,
+            "landmarks_hand2": None,
+            "hands_by_side": {"Left": None, "Right": None},
+            "shoulder_l": None,
+            "shoulder_r": None,
+        }
 
     def release(self):
         self._cap.release()
         self._landmarker.close()
+        if self._pose is not None:
+            self._pose.close()

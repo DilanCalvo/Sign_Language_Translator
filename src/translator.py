@@ -135,17 +135,20 @@ class Translator:
 
     def _call_api(self, glosses) -> str:
         system = _SYSTEM_PROMPT.format(lang=self._lang)
-        # A short, latency-sensitive task: keep thinking off and effort low so
-        # the result comes back fast; instruct the model to emit only the
-        # sentence (Opus may otherwise narrate its reasoning when thinking off).
-        resp = self._client.messages.create(
+        kwargs = dict(
             model=self._model,
             max_tokens=256,
-            thinking={"type": "disabled"},
-            output_config={"effort": "low"},
             system=system,
             messages=[{"role": "user", "content": " ".join(glosses)}],
         )
+        # 'effort' / adaptive thinking are an Opus/Sonnet optimization (keep this
+        # tiny, latency-sensitive task fast and cheap); Haiku does NOT accept
+        # them and would 400. So only send them when the model supports them,
+        # which lets TRANSLATION_MODEL be swapped to Haiku with no other change.
+        if "haiku" not in self._model.lower():
+            kwargs["thinking"] = {"type": "disabled"}
+            kwargs["output_config"] = {"effort": "low"}
+        resp = self._client.messages.create(**kwargs)
         text = next((b.text for b in resp.content if b.type == "text"), "").strip()
         return text or self._fallback(glosses)
 

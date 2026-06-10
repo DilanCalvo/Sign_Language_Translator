@@ -5,7 +5,10 @@ Loads the trained models and classifies landmarks into letters/words based
 on the data produced by detector.py.
 
 Input contract (dict from detector.py):
-    {"num_hands": int, "landmarks_hand1": list[float]|None, "landmarks_hand2": list[float]|None}
+    {"num_hands": int, "landmarks_hand1": list|None, "landmarks_hand2": list|None,
+     "hands_by_side": {"Left": list|None, "Right": list|None},
+     "shoulder_l": (x,y)|None, "shoulder_r": (x,y)|None}
+Letters use landmarks_hand1 (detection order); words use hands_by_side + shoulders.
 
 Output contract:
     {
@@ -31,8 +34,10 @@ word_prediction: dynamic-sign prediction. It is None when:
   - or the predicted class is the negative class WORD_NULL_LABEL ("nothing").
 
 The word model is a TEMPORAL sequence model (TCN): the rolling buffer of recent
-normalized frames is resampled to WORD_SEQ_LEN and fed as a (1, WORD_SEQ_LEN, 63)
-tensor — it reads the movement over time, not an order-blind mean+std summary.
+body-anchored two-hand frames (WORD_FEATURE_DIM values each, built by
+src.utils.build_word_features) is resampled to WORD_SEQ_LEN and fed as a
+(1, WORD_SEQ_LEN, WORD_FEATURE_DIM) tensor — it reads the movement over time,
+including WHERE the hands are relative to the body.
 """
 
 import json
@@ -50,6 +55,7 @@ from config import (
     LABELS_WORDS_PATH     as _LABELS_WORDS,
     LABELS_NUMBERS_PATH   as _LABELS_NUMBERS,
     WORD_SEQ_LEN          as _SEQ_LEN,
+    WORD_FEATURE_DIM      as _FEATURE_DIM,
     WORD_BUFFER_FRAMES    as _BUFFER_FRAMES,
     WORD_MIN_FRAMES       as _MIN_FRAMES,
     WORD_MOTION_WINDOW    as _MOTION_WINDOW,
@@ -60,7 +66,7 @@ from config import (
     WORD_MIN_MOTION_STD   as _MIN_MOTION_STD,
     ALT_MIN_CONFIDENCE    as _ALT_MIN_CONFIDENCE,
 )
-from src.utils import normalize_landmarks, resample_sequence
+from src.utils import normalize_landmarks, resample_sequence, build_word_features
 
 
 class Classifier:
@@ -92,18 +98,23 @@ class Classifier:
                 )
             else:
                 candidate = tf.keras.models.load_model(_MODEL_WORDS, compile=False)
-                # Be honest about an incompatible (legacy) model instead of
-                # crashing at inference. The temporal model takes a 3-D input
-                # (batch, time, 63); the old mean+std model took a 2-D (batch,
-                # 126). If we find the old one, disable words and tell the user
-                # to retrain — letters keep working.
-                if len(candidate.input_shape) != 3:
+                # Be honest about an incompatible model instead of crashing at
+                # inference. The current model takes a 3-D input
+                # (batch, time, WORD_FEATURE_DIM). Reject anything that is not a
+                # sequence model OR has a different feature width (e.g. an older
+                # 63-value one-hand model, or the legacy 2-D mean+std model).
+                incompatible = (
+                    len(candidate.input_shape) != 3
+                    or candidate.input_shape[-1] != _FEATURE_DIM
+                )
+                if incompatible:
                     print(
-                        "  [WARN] The word model is the old mean+std format "
-                        f"(input {candidate.input_shape}); the app now uses a "
-                        "temporal sequence model.\n"
-                        "         Re-train it: python training/train_words.py "
-                        "(after capturing with capture/capture_words.py).\n"
+                        f"  [WARN] The word model is incompatible (input "
+                        f"{candidate.input_shape}; expected (None, {_SEQ_LEN}, "
+                        f"{_FEATURE_DIM})). It predates the body-anchored "
+                        "two-hand features.\n"
+                        "         Re-capture and re-train: python capture/capture_words.py "
+                        "then python training/train_words.py.\n"
                         "         Word mode is disabled until then; letters still work."
                     )
                 else:
@@ -167,9 +178,10 @@ class Classifier:
             self._last_motion = 0.0
             return self._empty()
 
-        # Update the word buffer with the current frame.
+        # Update the word buffer with the current frame (needs both hands + the
+        # body anchor, so it takes the whole landmarks dict, not just hand1).
         # _last_motion is updated internally in _run_words().
-        word_pred = self._update_word_buffer(h1)
+        word_pred = self._update_word_buffer(landmarks_data)
 
         # Static classification with the model selected by the active mode.
         if static_mode == "numbers":
@@ -225,18 +237,24 @@ class Classifier:
             "top3":       top3,
         }
 
-    def _update_word_buffer(self, h1_flat):
+    def _update_word_buffer(self, landmarks_data):
         if self._model_words is None:
             return None
-        normalized = normalize_landmarks(h1_flat)
-        self._word_buffer.append(normalized)
+        # Body-anchored, two-hand feature (slots by handedness). Hands are taken
+        # from the handedness slots; the body frame from the shoulders.
+        by_side = landmarks_data["hands_by_side"]
+        feat = build_word_features(
+            by_side["Left"], by_side["Right"],
+            landmarks_data["shoulder_l"], landmarks_data["shoulder_r"],
+        )
+        self._word_buffer.append(feat)
         if len(self._word_buffer) < _MIN_FRAMES:
             self._last_motion = 0.0
             return None
         return self._run_words()
 
     def _run_words(self):
-        arr = np.array(list(self._word_buffer), dtype=np.float32)  # (<=BUFFER, 63)
+        arr = np.array(list(self._word_buffer), dtype=np.float32)  # (<=BUFFER, FEATURE_DIM)
 
         # Motion over only the most recent frames: detects quickly when the
         # user stops the hand. Averaging the whole buffer would keep a motion
@@ -270,7 +288,7 @@ class Classifier:
     def _warmup(self):
         self._model_one(tf.zeros((1, 63), dtype=tf.float32), training=False)
         if self._model_words is not None:
-            self._model_words(tf.zeros((1, _SEQ_LEN, 63), dtype=tf.float32), training=False)
+            self._model_words(tf.zeros((1, _SEQ_LEN, _FEATURE_DIM), dtype=tf.float32), training=False)
         if self._model_numbers is not None:
             self._model_numbers(tf.zeros((1, 63), dtype=tf.float32), training=False)
 

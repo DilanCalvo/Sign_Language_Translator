@@ -29,6 +29,12 @@ logs/
 
 # Internal context file (not part of the public project)
 CLAUDE.md
+ROADMAP.md
+internal_project_documentation.txt
+
+# Secrets — real API keys live in .env, which must NEVER be committed.
+# .env.example is the committable template (no real key in it).
+.env
 
 # NOTE: trained models (model/*.h5, model/*.task), label maps (model/*.json)
 # and the captured samples (data/real_capture/) ARE committed on purpose, so the

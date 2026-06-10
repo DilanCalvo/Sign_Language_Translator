@@ -100,7 +100,7 @@ ALT_MIN_CONFIDENCE = 0.08
 #
 # Default: 0.60 (TCN sequence model with a trained negative class).
 
-WORD_CONFIDENCE_THRESHOLD = 0.60
+WORD_CONFIDENCE_THRESHOLD = 0.75
 
 
 # ================================================================
@@ -128,6 +128,31 @@ WORD_CONFIDENCE_THRESHOLD = 0.60
 # Default: 32 frames (empirically validated; ~1s of signing resampled to 32).
 
 WORD_SEQ_LEN = 32
+
+# Number of values per frame in the WORD feature vector (body-anchored).
+#
+# Unlike letters (one hand, 63 values = 21 landmarks x,y,z), the word model sees
+# BOTH hands AND where each hand is relative to the body. This lets it tell apart
+# signs with the same handshape at different body locations (e.g. a hand at the
+# chest vs. at the forehead) and signs that use two hands.
+#
+# Layout per frame (built by src.utils.build_word_features):
+#   [ left  hand: 63 shape + 2 wrist position ]  = 65
+#   [ right hand: 63 shape + 2 wrist position ]  = 65
+#                                          total = 130
+#
+#   - "shape" = the 21 landmarks centered on the wrist and scaled by hand size
+#     (the same representation letters use — pure handshape, position-invariant).
+#   - "wrist position" = the wrist's (x, y) relative to the shoulder center,
+#     scaled by shoulder width. This is the BODY ANCHOR — invariant to where the
+#     person stands or how big they are. z is omitted (MediaPipe depth is noisy).
+#   - A missing hand (one-handed sign, or hand out of frame) is all zeros, a
+#     pattern the model learns to read as "that hand is absent".
+#
+# CRITICAL: this MUST match in capture, training and inference (imported here).
+# Changing it requires re-capturing and re-training.
+
+WORD_FEATURE_DIM = 130
 
 # Max length of the rolling live buffer the classifier keeps while you sign.
 #
@@ -246,19 +271,23 @@ WORD_SMOOTH_WINDOW = 5
 
 WORD_SMOOTH_MIN_VOTES = 3
 
-# Lock-out frames after a word is detected.
+# Lock-out TIME after a word is detected (seconds).
 #
-# Once a sign is confirmed, new predictions are locked for this many frames.
-# The detected word stays visible. This prevents the same gesture from
-# repeating in bursts and gives the user time to move to the next sign.
+# Once a sign is confirmed, new predictions are locked for this long. The
+# detected word stays visible. This prevents the same gesture from repeating in
+# bursts and gives the user a moment to move to the next sign.
 #
-#   Raise → the same sign is shown longer; harder to repeat.
-#   Lower → faster cycle; may detect the same gesture twice in a row if the
-#           user does not move the hand.
+# Time-based (not frames) on purpose: the real wait must not depend on the frame
+# rate, which varies with the machine and with how many models run per frame
+# (the pose model lowers FPS). At 1.0s the next sign can be made about a second
+# after the previous one is recognized.
 #
-# Default: 45 frames ~= 1.5s at 30fps.
+#   Raise → the same sign is shown longer; harder to repeat by accident.
+#   Lower → faster cadence; may catch the same gesture twice if you hold it.
+#
+# Default: 1.0 second.
 
-WORD_COOLDOWN_FRAMES = 45
+WORD_COOLDOWN_SECONDS = 2.0
 
 # Frames of inactivity before the accumulated WORD sentence clears itself.
 #
@@ -270,8 +299,8 @@ WORD_COOLDOWN_FRAMES = 45
 #   Raise → the sentence lingers longer; good for slow signers.
 #   Lower → clears sooner; risk of cutting a sentence mid-thought.
 #
-# Note: the per-word cooldown (WORD_COOLDOWN_FRAMES) counts against this too,
-# so the effective gap the user has between signs is this minus the cooldown.
+# Note: the per-word cooldown (WORD_COOLDOWN_SECONDS) also runs after each sign,
+# so the effective gap the user has between signs includes it.
 # Default: 150 frames ~= 5s at 30fps.
 
 WORD_SENTENCE_PAUSE_FRAMES = 150
@@ -305,19 +334,37 @@ LETTER_COOLDOWN_FRAMES = 20
 #  5. CAPTURE — parameters used when recording new word samples
 # ================================================================
 
-# Target number of takes to record per word in capture_words.py.
+# CUMULATIVE target of takes per word, across ALL sessions, in capture_words.py.
 #
 # MORE IMPORTANT THAN THE COUNT: capture across MULTIPLE SESSIONS (different
 # days, lighting, clothing, distance). A model trained on many takes from a
 # SINGLE session memorizes that session, not the sign — it scores high in
-# validation but fails live. 3 sessions x ~15 takes generalizes far better
-# than 45 takes in one sitting. Re-run the script on different days; it appends.
+# validation but fails live. 3 sessions x ~7 takes generalizes far better than
+# 20 takes in one sitting. Re-run the script on different days; it appends until
+# this cumulative total is reached, then the word is auto-skipped.
 #
-#   Raise → more data per session. Lower → faster test sessions.
+#   Raise → more total data (more sessions needed). Lower → fewer sessions.
 #
-# Default: 15 takes per word per run (aim for 3+ runs on different days).
+# Set to 34: the existing "legacy" session already holds ~20 takes/word from a
+# single sitting, so this leaves room for two more sessions (at the per-session
+# cap of 7 below) — 20 + 7 + 7 — giving three sessions total for honest
+# cross-session validation. On a clean dataset, ~21 (3 x 7) would be the default.
 
-CAPTURE_TARGET_PER_WORD = 15
+CAPTURE_TARGET_PER_WORD = 34
+
+# PER-SESSION cap of takes per word in a single capture_words.py run.
+#
+# This enforces the multi-session discipline above: once this many takes of a
+# word are recorded in ONE sitting, the capturer auto-advances to the next word.
+# A single session therefore CANNOT fill the whole cumulative quota (which would
+# defeat generalization). You leave, come back another day, and the per-session
+# counter resets while the cumulative total keeps climbing toward
+# CAPTURE_TARGET_PER_WORD.
+#
+#   Rule of thumb: CAPTURE_TARGET_PER_WORD / desired number of sessions.
+# Default: 7 (so ~3 sessions reach the cumulative target of 20).
+
+CAPTURE_PER_SESSION_PER_WORD = 7
 
 # Frames the captured sequence is resampled to before saving.
 #
@@ -352,6 +399,13 @@ LABELS_WORDS_PATH     = "model/labels_words.json"
 LABELS_NUMBERS_PATH   = "model/labels_numbers.json"
 
 HAND_LANDMARKER_PATH  = "model/hand_landmarker.task"
+
+# MediaPipe pose model — used ONLY by the word pipeline to anchor the hands to
+# the body (see WORD_FEATURE_DIM below). Letters/numbers do not need it. If this
+# file is missing the app still runs: word features fall back to no body anchor
+# (the position part becomes zero), with a warning at startup.
+
+POSE_LANDMARKER_PATH  = "model/pose_landmarker_lite.task"
 
 
 # ================================================================
@@ -458,10 +512,13 @@ TRANSLATION_ENABLED = True
 TRANSLATION_TARGET_LANGUAGE = "Spanish"
 
 # Claude model used for translation. Glosses->sentence is a small, well-scoped
-# task; the default is the most capable model, but any current model works.
+# task, so a fast, cheap model (Haiku) is a great fit. Any current model works:
+#   "claude-haiku-4-5"  -> fastest + cheapest (default; ideal for this task)
+#   "claude-sonnet-4-6" -> a step up in quality
+#   "claude-opus-4-8"   -> most capable (overkill here)
 # The API key is read from the ANTHROPIC_API_KEY environment variable.
 
-TRANSLATION_MODEL = "claude-opus-4-8"
+TRANSLATION_MODEL = "claude-haiku-4-5"
 
 # If the API is unreachable (no key, no internet, error), fall back to showing
 # the raw glosses joined by spaces instead of failing. Keeps the demo robust.
