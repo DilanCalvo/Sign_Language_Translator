@@ -1,23 +1,32 @@
 """
-One-hand (letter) model training.
+Numbers (digit 0-9) model training.
+
+Digits are static one-hand poses, so this uses the SAME pipeline as the letter
+model (training/train_letters.py): wrist-centered scale-invariant normalization,
+a dense network, and the same augmentation. It is a deliberate mirror, kept as a
+separate model on purpose (several ASL digits share a handshape with a letter,
+so merging them would create genuine ambiguity — see capture/capture_numbers.py).
 
 Input:
-    CSVs captured with capture/capture_letters.py
+    Every CSV in data/real_capture/numbers/ (auto-discovered). Capture more with
+    capture/capture_numbers.py and just re-run this — no paths to edit, so a
+    multi-session dataset (different days / lighting / distance) is frictionless.
 
 Output:
-    model/model_one_hand.h5         (best model by val_accuracy)
-    model/labels_one_hand.json      (index -> class map)
+    model/model_numbers.h5      (best model by val_accuracy)
+    model/labels_numbers.json   (index -> class map)
+    -> classifier.py loads both automatically; the app's numbers mode (key N)
+       lights up with no further changes.
 
 Strategy:
-    - Wrist-centered, middle-base-scaled normalization.
-    - Stratified 80/20 split over the captured data.
+    - Wrist-centered, middle-base-scaled normalization (single source of truth).
+    - Stratified 80/20 split.
     - Class weights to correct imbalance.
-    - Small Gaussian-noise augmentation (robustness to MediaPipe jitter).
-    - Random horizontal mirror (learns both hands).
-    - Dense architecture with BatchNorm + Dropout + L2 regularization.
+    - Gaussian-noise + scale jitter + random horizontal mirror augmentation.
     - EarlyStopping + ReduceLROnPlateau + ModelCheckpoint.
 """
 
+import glob
 import json
 import os
 import sys
@@ -34,28 +43,14 @@ from tensorflow.keras import callbacks, layers, models, regularizers
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.utils import normalize_landmarks
+from config import (
+    MODEL_NUMBERS_PATH  as MODEL_OUT,
+    LABELS_NUMBERS_PATH as LABELS_OUT,
+)
 
-
-MODEL_OUT  = "model/model_one_hand.h5"
-LABELS_OUT = "model/labels_one_hand.json"
-
-# CSVs captured with capture/capture_letters.py.
-# Can be a single path (str) or a list of paths (list).
-DATA_CSVS = [
-    "data/real_capture/letters/capture_20260520_180454_A-B-C.csv",
-    "data/real_capture/letters/capture_20260520_143836_D-E-F.csv",
-    "data/real_capture/letters/capture_20260520_145116_G-H-I-.csv",
-    "data/real_capture/letters/capture_20260520_173739_I-K-L.csv",
-    "data/real_capture/letters/capture_20260520_174943_M-N-O.csv",
-    "data/real_capture/letters/capture_20260520_182414_P-Q-R.csv",
-    "data/real_capture/letters/capture_20260520_184531_S-T-U.csv",
-    "data/real_capture/letters/capture_20260520_204902_V-W-X.csv",
-    "data/real_capture/letters/capture_20260521_212857_Y.csv"
-    # Add new capture sessions here:
-    # "data/real_capture/letters/capture_YYYYMMDD_HHMMSS_XYZ.csv",
-]
-
-EXCLUDED_CLASSES = {"nothing"}
+# Directory scanned for capture CSVs. Every *.csv here is used, so adding a
+# session is just re-running capture/capture_numbers.py (no code change).
+DATA_DIR = "data/real_capture/numbers"
 
 BATCH_SIZE   = 64      # small = more gradient steps per epoch on a small dataset
 EPOCHS       = 300
@@ -70,24 +65,23 @@ _MIRROR_MASK_63 = tf.constant(
 )
 
 
-def _load_data(csvs) -> tuple[np.ndarray, np.ndarray]:
-    paths = [csvs] if isinstance(csvs, str) else csvs
-    frames = []
-    for p in paths:
-        if p and os.path.isfile(p):
-            df = pd.read_csv(p)
-            frames.append(df)
-            print(f"  + {len(df):,} samples from {p}")
-        elif p:
-            print(f"  [WARN] File not found: {p}")
-
-    if not frames:
-        print("[ERROR] No CSV found. Check DATA_CSVS.")
+def _load_data(data_dir) -> tuple[np.ndarray, np.ndarray]:
+    paths = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
+    if not paths:
+        print(f"[ERROR] No CSV found in {data_dir}/. "
+              "Capture first: python capture/capture_numbers.py")
         raise SystemExit(1)
 
+    frames = []
+    for p in paths:
+        df = pd.read_csv(p)
+        frames.append(df)
+        print(f"  + {len(df):,} samples from {p}")
+
     df = pd.concat(frames, ignore_index=True)
-    df = df[~df["label"].isin(EXCLUDED_CLASSES)].reset_index(drop=True)
-    labels = np.array(df["label"].tolist())
+    # Digit labels can read as ints from CSV; force them back to strings so the
+    # label map is stable ("0".."9").
+    labels = np.array([str(v) for v in df["label"].tolist()])
     raw = df.drop(columns=["label"]).to_numpy(dtype=np.float32)
     normalized = np.stack([normalize_landmarks(row) for row in raw])
     return normalized, labels
@@ -139,7 +133,7 @@ def _build_model(input_dim, num_classes):
 
     outputs = layers.Dense(num_classes, activation="softmax", name="prediction")(x)
 
-    model = models.Model(inputs, outputs, name="one_hand_classifier")
+    model = models.Model(inputs, outputs, name="numbers_classifier")
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
         loss="sparse_categorical_crossentropy",
@@ -198,7 +192,7 @@ def main():
     tf.random.set_seed(SEED)
 
     print("Loading and normalizing data...")
-    x_all, y_all_str = _load_data(DATA_CSVS)
+    x_all, y_all_str = _load_data(DATA_DIR)
 
     try:
         x_train, x_val, y_train_str, y_val_str = train_test_split(
@@ -249,6 +243,7 @@ def main():
 
     print(f"\nModel saved to:  {MODEL_OUT}")
     print(f"Labels saved to: {LABELS_OUT}")
+    print("\nDone. Launch the app and press N to use numbers mode.")
 
 
 if __name__ == "__main__":
