@@ -64,7 +64,7 @@ LETTER_CONFIDENCE_THRESHOLD = 0.80
 # 63 values), so the same calibration logic applies. Kept separate so it can
 # be tuned independently once a numbers model is trained.
 
-NUMBER_CONFIDENCE_THRESHOLD = 0.80
+NUMBER_CONFIDENCE_THRESHOLD = 0.60
 
 # Low-confidence boundary for the "show alternatives" UI.
 #

@@ -326,7 +326,7 @@ archivos); una sola fuente de verdad para la normalización y las features.
 | Detección de manos (MediaPipe) | Completa |
 | Clasificación en tiempo real | Completa |
 | Modelo de letras (A–Y estáticas) | Entrenado y operativo |
-| Modelo de palabras (TCN) | Entrenado, operativo y validado — 93.5% val accuracy en entrenamiento (3 sesiones, 592 muestras); validación cruzada leak-free (`--cv 5`, 3-fold por sesión) confirma **93.2%** de generalización real entre sesiones |
+| Modelo de palabras (TCN) | Entrenado, operativo y validado — 92.9% val accuracy en entrenamiento (6 sesiones, 612 muestras); validación cruzada leak-free (`--cv 5`, 5-fold por sesión) confirma **94.1%** de generalización real entre sesiones |
 | Captura de palabras (multi-sesión) | Completa |
 | Entrenamiento de palabras (TCN) | Completo |
 | Traducción glosa→frase (LLM) | Completa (con fallback offline) |
@@ -345,16 +345,16 @@ archivos); una sola fuente de verdad para la normalización y las features.
 
 - **J y Z** requieren movimiento; aún no se reconocen como poses estáticas.
 - **Vocabulario de palabras acotado:** 16 palabras + `nothing`. Más clases y
-  más muestras por seña mejoran la fiabilidad; la clase `me` en particular está
-  desbalanceada (14 muestras vs. 34 del resto).
+  más muestras por seña mejoran la fiabilidad (todas las clases ya balanceadas
+  a 34 muestras, `nothing` a 68).
 - **Confusión en un cluster de señas y en la clase `nothing`:** la validación
-  cruzada leak-free (`training/evaluate.py --cv 5`, 2026-07-09) da 93.2% global
-  pero muestra dos puntos débiles: `nothing` tiene recall 0.75 (a veces "dice"
-  una palabra cuando no hay seña) y `need`/`help` se confunden con `want`
-  (`want` precision 0.81). Subir `WORD_CONFIDENCE_THRESHOLD` no lo corrige — el
-  barrido de umbral (0.5–0.9) da ~93-94% de accuracy parejo en todo el rango,
-  así que es un problema de datos/separabilidad, no de calibración. Fix
-  probable: capturar más muestras variadas de esas clases.
+  cruzada leak-free (`training/evaluate.py --cv 5`, 2026-07-09) da 94.1% global
+  pero muestra dos puntos débiles persistentes: `nothing` tiene recall 0.76 (a
+  veces "dice" una palabra cuando no hay seña) y `need` se confunde con `want`
+  (`need` recall 0.82). Subir `WORD_CONFIDENCE_THRESHOLD` no lo corrige — el
+  barrido de umbral da accuracy parejo en todo el rango, así que es un problema
+  de datos/separabilidad, no de calibración. Fix probable: capturar más
+  muestras variadas de esas clases.
 - **Números (0–9):** infraestructura lista, falta capturar y entrenar el modelo.
 - **Calidad dependiente del entorno:** iluminación y posición de cámara influyen;
   capturar muestras propias en el setup habitual mejora la precisión.
