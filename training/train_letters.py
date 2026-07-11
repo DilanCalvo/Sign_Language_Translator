@@ -15,7 +15,9 @@ Strategy:
     - Stratified 80/20 split over the captured data.
     - Class weights to correct imbalance.
     - Small Gaussian-noise augmentation (robustness to MediaPipe jitter).
+    - Random 3-axis rotation (robustness to camera/wrist angle).
     - Random horizontal mirror (learns both hands).
+    - Label-smoothed loss (softer softmax targets, less overconfident wrong answers).
     - Dense architecture with BatchNorm + Dropout + L2 regularization.
     - EarlyStopping + ReduceLROnPlateau + ModelCheckpoint.
 """
@@ -54,6 +56,15 @@ BATCH_SIZE   = 64      # small = more gradient steps per epoch on a small datase
 EPOCHS       = 300
 NOISE_STDDEV = 0.012   # more noise -> more robust to MediaPipe variations
 SCALE_JITTER = 0.08    # +/-8% scale -> simulates the hand at different distances
+# Rotation augmentation: every letter in data/real_capture/letters/ was captured
+# in a single session (fixed camera angle), so the model never saw the same sign
+# from a different viewpoint. Roll (in-image-plane tilt) only mixes x/y, the two
+# axes MediaPipe estimates directly from pixels, so it can be generous. Pitch/yaw
+# rotate through z, MediaPipe's noisier depth estimate, so they stay tighter to
+# avoid manufacturing implausible depth structure.
+ROTATION_MAX_DEG_ROLL      = 25.0
+ROTATION_MAX_DEG_PITCH_YAW = 12.0
+LABEL_SMOOTHING = 0.05  # softens the softmax target; conservative given ~150 samples/class
 L2   = 1e-4            # more regularization for a small dataset
 SEED = 42
 
@@ -87,8 +98,37 @@ def _load_data(data_dir) -> tuple[np.ndarray, np.ndarray, int]:
     return normalized, labels, len(paths)
 
 
+def _random_rotation(x):
+    # Rotate the 21 (x, y, z) points as a rigid body around the wrist (already
+    # the origin post-normalization). A shared rotation matrix applied to every
+    # point can't produce anatomically impossible hand shapes -- it only
+    # re-orients the captured pose, simulating a camera/wrist angle the single
+    # capture session never showed the model.
+    to_rad = np.pi / 180.0
+    roll  = tf.random.uniform((), -ROTATION_MAX_DEG_ROLL, ROTATION_MAX_DEG_ROLL) * to_rad
+    pitch = tf.random.uniform((), -ROTATION_MAX_DEG_PITCH_YAW, ROTATION_MAX_DEG_PITCH_YAW) * to_rad
+    yaw   = tf.random.uniform((), -ROTATION_MAX_DEG_PITCH_YAW, ROTATION_MAX_DEG_PITCH_YAW) * to_rad
+
+    cz, sz = tf.cos(roll), tf.sin(roll)
+    rot_z = tf.reshape(tf.stack([cz, -sz, 0.0, sz, cz, 0.0, 0.0, 0.0, 1.0]), (3, 3))
+
+    cy, sy = tf.cos(yaw), tf.sin(yaw)
+    rot_y = tf.reshape(tf.stack([cy, 0.0, sy, 0.0, 1.0, 0.0, -sy, 0.0, cy]), (3, 3))
+
+    cx, sx = tf.cos(pitch), tf.sin(pitch)
+    rot_x = tf.reshape(tf.stack([1.0, 0.0, 0.0, 0.0, cx, -sx, 0.0, sx, cx]), (3, 3))
+
+    rotation = rot_z @ rot_y @ rot_x
+    points = tf.reshape(x, (21, 3))
+    rotated = tf.matmul(points, tf.transpose(rotation))
+    return tf.reshape(rotated, (63,))
+
+
 def _augment(x, y):
-    # Gaussian noise: robustness to MediaPipe jitter.
+    # Rotation first: models "the camera/wrist angle differs from capture".
+    x = _random_rotation(x)
+
+    # Gaussian noise: robustness to MediaPipe jitter, on top of the rotated pose.
     x = x + tf.random.normal(tf.shape(x), mean=0.0, stddev=NOISE_STDDEV)
 
     # Scale jitter: simulates the hand at different distances from the camera.
@@ -134,9 +174,22 @@ def _build_model(input_dim, num_classes):
     outputs = layers.Dense(num_classes, activation="softmax", name="prediction")(x)
 
     model = models.Model(inputs, outputs, name="one_hand_classifier")
+
+    def _sparse_ce_with_smoothing(y_true, y_pred):
+        # Keras 3's SparseCategoricalCrossentropy has no label_smoothing param,
+        # so labels are one-hot'd inside the loss only -- everywhere else
+        # (LabelEncoder, class_weight, the "accuracy" metric) keeps using plain
+        # integer labels, no pipeline changes needed. Softens the target so the
+        # model is never trained to push softmax all the way to 1.0, which is
+        # what makes a wrong prediction still read as "100% confident".
+        y_true = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
+        y_true_oh = tf.one_hot(y_true, depth=num_classes)
+        return tf.keras.losses.categorical_crossentropy(
+            y_true_oh, y_pred, label_smoothing=LABEL_SMOOTHING)
+
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss="sparse_categorical_crossentropy",
+        loss=_sparse_ce_with_smoothing,
         metrics=["accuracy"],
     )
     return model
@@ -248,6 +301,9 @@ def main():
         val_accuracy=val_acc,
         config={"epochs": EPOCHS, "batch_size": BATCH_SIZE,
                 "noise_stddev": NOISE_STDDEV, "scale_jitter": SCALE_JITTER,
+                "rotation_max_deg_roll": ROTATION_MAX_DEG_ROLL,
+                "rotation_max_deg_pitch_yaw": ROTATION_MAX_DEG_PITCH_YAW,
+                "label_smoothing": LABEL_SMOOTHING,
                 "l2": L2, "seed": SEED},
     )
 

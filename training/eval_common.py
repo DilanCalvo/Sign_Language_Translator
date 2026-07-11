@@ -92,6 +92,30 @@ def _print_top_confusions(cm, names, k=8):
         print(f"  {cnt:>3}x   {t:<12} -> {p}")
 
 
+def _expected_calibration_error(y_true, y_pred, y_conf, n_bins=10):
+    """Standard 10-bin ECE (Guo et al., 2017): how far top-1 confidence is from
+    actual accuracy, averaged over equal-width confidence bins and weighted by
+    bin size. 0 = perfectly calibrated; a model that says "100%" while wrong
+    drives this up regardless of overall accuracy, which is exactly the
+    "sounds more confident than it should" symptom this metric is meant to
+    catch (accuracy alone does not)."""
+    y_true = np.asarray(y_true); y_pred = np.asarray(y_pred); y_conf = np.asarray(y_conf)
+    correct = (y_pred == y_true).astype(np.float64)
+    n = len(y_conf)
+    if n == 0:
+        return 0.0
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        in_bin = (y_conf > lo) & (y_conf <= hi) if lo > 0 else (y_conf >= lo) & (y_conf <= hi)
+        if not in_bin.any():
+            continue
+        bin_acc = correct[in_bin].mean()
+        bin_conf = y_conf[in_bin].mean()
+        ece += in_bin.sum() / n * abs(bin_acc - bin_conf)
+    return ece
+
+
 def _print_threshold_sweep(y_true, y_pred, y_conf, threshold):
     print("\nConfidence-threshold sweep (coverage vs. accuracy among accepted):")
     print(f"  {'thresh':>7} {'coverage':>9} {'accuracy':>9}")
@@ -141,7 +165,10 @@ def report(y_true, y_pred, y_conf, names, png_path=None, threshold=None):
     """
     cm = _confusion(y_true, y_pred, len(names))
     overall = np.mean(np.asarray(y_true) == np.asarray(y_pred)) if len(y_true) else 0.0
+    ece = _expected_calibration_error(y_true, y_pred, y_conf)
     print(f"\nOverall accuracy: {overall*100:.1f}%   (n={len(y_true)})")
+    print(f"Expected Calibration Error (ECE, 10 bins): {ece*100:.1f}%   "
+          f"(0% = confidence always matches actual accuracy)")
     _print_confusion(cm, names)
     _print_per_class(cm, names)
     _print_top_confusions(cm, names)
