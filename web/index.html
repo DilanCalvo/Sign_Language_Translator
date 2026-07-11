@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤟</text></svg>">
 <title>Sign Language Translator — ASL letters</title>
 <style>
   :root { color-scheme: dark; }
@@ -38,6 +39,9 @@
     font-size: 4.5rem; font-weight: 700; min-width: 5.5rem; text-align: center;
     color: #fff; line-height: 1;
   }
+  /* Uncommitted guess (confidence between display and acceptance thresholds):
+     visibly a hint, never mistakable for an accepted letter. */
+  #letter.hint { color: #7a8699; font-size: 2.8rem; font-weight: 500; }
   #conf-wrap { width: 180px; }
   #conf-track {
     height: 14px; background: #333; border-radius: 7px; overflow: hidden;

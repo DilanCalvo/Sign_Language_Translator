@@ -2,3 +2,35 @@
 # Connect the repo in the Netlify UI and it picks this file up automatically.
 [build]
   publish = "web"
+
+# Cache policy. The model/labels/fixtures/JS keep the same filenames across
+# redeploys, so browsers must REVALIDATE them on each visit (no-cache = cheap
+# conditional request via ETag, NOT "don't cache") — otherwise a retrained
+# model can be silently shadowed by a stale cached copy. The vendored MediaPipe
+# runtime is version-pinned and only ever changes together with its path, so
+# it can be cached forever.
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/js/*"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/model/*"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/fixtures/*"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/vendor/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"

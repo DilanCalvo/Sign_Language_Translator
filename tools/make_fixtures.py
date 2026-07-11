@@ -34,25 +34,29 @@ CSV_DIR = REPO / "data" / "real_capture" / "letters"
 OUT_DIR = REPO / "web" / "fixtures"
 MODEL_PATH = REPO / "model" / "model_one_hand.h5"
 
-ROWS_PER_FILE = 1     # spread cases across sessions/letters, not one big file
-MAX_REAL_CASES = 10
 SEED = 42
 
 
 def collect_real_rows():
-    """One raw row per CSV (different letter each time when possible)."""
+    """One raw row per LETTER, sampled across ALL capture CSVs.
+
+    Per-letter (not per-file) coverage on purpose: every class present in the
+    capture data gets a parity case, so a bug that only shows up in some part
+    of the class range cannot slip through the gate. Deterministic (fixed
+    seed) so reruns produce identical fixtures for identical data.
+    """
     rng = np.random.default_rng(SEED)
-    cases, seen_labels = [], set()
-    for path in sorted(CSV_DIR.glob("*.csv"))[:MAX_REAL_CASES]:
+    by_label = {}
+    for path in sorted(CSV_DIR.glob("*.csv")):
         with open(path, encoding="utf-8") as f:
-            rows = list(csv.reader(f))[1:]  # skip header
-        if not rows:
-            continue
-        # Prefer a label we have not covered yet so cases span the alphabet.
-        fresh = [r for r in rows if r[0] not in seen_labels] or rows
-        row = fresh[int(rng.integers(len(fresh)))]
-        seen_labels.add(row[0])
-        cases.append((row[0], [float(v) for v in row[1:64]]))
+            for row in list(csv.reader(f))[1:]:  # skip header
+                if row:
+                    by_label.setdefault(row[0], []).append(row)
+    cases = []
+    for label in sorted(by_label):
+        rows = by_label[label]
+        row = rows[int(rng.integers(len(rows)))]
+        cases.append((label, [float(v) for v in row[1:64]]))
     return cases
 
 

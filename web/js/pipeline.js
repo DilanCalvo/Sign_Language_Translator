@@ -36,11 +36,14 @@ import {
 } from "./config.js";
 import { normalizeLandmarks, PredictionSmoother, LetterBuffer } from "./utils.js";
 import { loadLettersModel } from "./model.js";
+// Vendored copy of @mediapipe/tasks-vision@0.10.14 (see web/vendor/): the app
+// must not depend on a CDN being reachable at demo time, and the runtime
+// version stays pinned to the one the .task file was validated with.
 import {
   FilesetResolver,
   HandLandmarker,
   DrawingUtils,
-} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+} from "../vendor/mediapipe/vision_bundle.mjs";
 
 // ---- DOM ----
 const els = {
@@ -94,13 +97,19 @@ function classify(flat63) {
 
 // ---- UI updates ----
 function updateHud(stable, result) {
+  // The "hint" style separates what the system ACTS ON (a committed, stable
+  // letter) from what it merely SURFACES (an uncommitted guess between the
+  // display and acceptance thresholds) — same design decision as the desktop
+  // HUD. They must not look identical.
   if (stable !== null) {
     els.letter.textContent = stable;
+    els.letter.classList.remove("hint");
   } else if (result && result.confidence >= LOW_CONFIDENCE_THRESHOLD) {
-    // Between thresholds: show the raw guess small (uncommitted), like the HUD.
     els.letter.textContent = result.top3.length ? result.top3[0].prediction : "–";
+    els.letter.classList.add("hint");
   } else {
     els.letter.textContent = "–";
+    els.letter.classList.remove("hint");
   }
 
   const conf = result ? result.confidence : 0;
@@ -129,55 +138,101 @@ function updateFps(now) {
 }
 
 // ---- Per-frame ----
+// A crash inside the frame callback would otherwise end the
+// requestVideoFrameCallback chain and freeze the app SILENTLY — the worst
+// possible failure in a live demo. Errors are caught, reported, and the loop
+// keeps going; only persistent failure (e.g. a dead GPU context) stops it,
+// with an honest message instead of a frozen image.
+let consecutiveErrors = 0;
+const MAX_CONSECUTIVE_ERRORS = 30; // ~1s of solid failures at 30fps
+
 function onFrame(now) {
-  const w = els.canvas.width, h = els.canvas.height;
+  try {
+    const w = els.canvas.width, h = els.canvas.height;
 
-  // Mirror BEFORE detection (parity with cv2.flip in src/detector.py).
-  ctx.save();
-  ctx.scale(-1, 1);
-  ctx.drawImage(video, -w, 0, w, h);
-  ctx.restore();
+    // Mirror BEFORE detection (parity with cv2.flip in src/detector.py).
+    ctx.save();
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, -w, 0, w, h);
+    ctx.restore();
 
-  const result = landmarker.detectForVideo(els.canvas, now);
-  const hand = result.landmarks && result.landmarks[0];
+    const result = landmarker.detectForVideo(els.canvas, now);
+    const hand = result.landmarks && result.landmarks[0];
 
-  let clsResult = null;
-  if (hand) {
-    drawer.drawConnectors(hand, HandLandmarker.HAND_CONNECTIONS,
-                          { color: "#ffffff", lineWidth: 2 });
-    drawer.drawLandmarks(hand, { color: "#ffd900", radius: 3 });
+    let clsResult = null;
+    if (hand) {
+      drawer.drawConnectors(hand, HandLandmarker.HAND_CONNECTIONS,
+                            { color: "#ffffff", lineWidth: 2 });
+      drawer.drawLandmarks(hand, { color: "#ffd900", radius: 3 });
 
-    // Flatten x,y,z — same order as src/detector.py builds landmarks_hand1.
-    const flat = new Array(63);
-    for (let i = 0; i < 21; i++) {
-      flat[i * 3] = hand[i].x;
-      flat[i * 3 + 1] = hand[i].y;
-      flat[i * 3 + 2] = hand[i].z;
+      // Flatten x,y,z — same order as src/detector.py builds landmarks_hand1.
+      const flat = new Array(63);
+      for (let i = 0; i < 21; i++) {
+        flat[i * 3] = hand[i].x;
+        flat[i * 3 + 1] = hand[i].y;
+        flat[i * 3 + 2] = hand[i].z;
+      }
+      clsResult = classify(flat);
+      smoother.update(clsResult.prediction);
+      setStatus("");
+    } else {
+      smoother.update(null);
+      setStatus("waiting for hand…");
     }
-    clsResult = classify(flat);
-    smoother.update(clsResult.prediction);
-    setStatus("");
-  } else {
-    smoother.update(null);
-    setStatus("waiting for hand…");
-  }
 
-  const stable = smoother.getStable();
-  if (letterBuffer.update(stable)) {
-    els.strip.textContent = letterBuffer.getText();
+    const stable = smoother.getStable();
+    if (letterBuffer.update(stable)) {
+      els.strip.textContent = letterBuffer.getText();
+    }
+    updateHud(stable, clsResult);
+    updateFps(now);
+    consecutiveErrors = 0;
+    framesSeen++;
+  } catch (err) {
+    consecutiveErrors++;
+    console.error("Frame processing error:", err);
+    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+      setStatus("The detector failed repeatedly. Reload the page to retry.", true);
+      return; // stop the loop — an honest halt beats an endless error storm
+    }
+    setStatus("detector hiccup — retrying…", true);
   }
-  updateHud(stable, clsResult);
-  updateFps(now);
   scheduleNext();
 }
 
+// Per-camera-frame callback when supported (no wasted detections at 60Hz),
+// otherwise plain rAF. Some environments expose requestVideoFrameCallback but
+// never deliver a frame (observed in headless Chromium with a fake camera):
+// a watchdog falls back to rAF so the app can never freeze silently before
+// its first frame. loopGeneration invalidates any callback scheduled under a
+// previous mode, so the fallback cannot leave two frame chains running.
+let framesSeen = 0;
+let useRvfc = false;
+let loopGeneration = 0;
+
 function scheduleNext() {
-  // Per-camera-frame callback when supported (no wasted detections at 60Hz),
-  // otherwise plain rAF.
-  if (video.requestVideoFrameCallback) {
-    video.requestVideoFrameCallback((now) => onFrame(now));
+  const gen = loopGeneration;
+  const cb = (now) => { if (gen === loopGeneration) onFrame(now); };
+  if (useRvfc) {
+    video.requestVideoFrameCallback(cb);
   } else {
-    requestAnimationFrame((now) => onFrame(now));
+    requestAnimationFrame(cb);
+  }
+}
+
+function startLoop() {
+  useRvfc = !!video.requestVideoFrameCallback;
+  scheduleNext();
+  if (useRvfc) {
+    setTimeout(() => {
+      if (framesSeen === 0) {
+        console.warn("requestVideoFrameCallback never fired; "
+                     + "falling back to requestAnimationFrame.");
+        useRvfc = false;
+        loopGeneration++; // orphan any still-pending rVFC callback
+        scheduleNext();
+      }
+    }, 1500);
   }
 }
 
@@ -235,7 +290,7 @@ async function main() {
     els.canvas.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
 
     setStatus("waiting for hand…");
-    scheduleNext();
+    startLoop();
   } catch (err) {
     if (err.name === "NotAllowedError") {
       setStatus("Camera permission denied. Allow the camera and reload.", true);

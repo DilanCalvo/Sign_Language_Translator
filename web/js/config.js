@@ -36,6 +36,8 @@ export const MODEL_URL = "model/letters/model_weights.json";
 export const LABELS_URL = "model/labels_one_hand.json";
 export const HAND_TASK_URL = "model/hand_landmarker.task";
 
-// MediaPipe Tasks Vision runtime, version-pinned (same reason as the .task).
-export const MEDIAPIPE_WASM_URL =
-  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+// MediaPipe Tasks Vision WASM runtime — vendored locally (web/vendor/) from
+// @mediapipe/tasks-vision@0.10.14, same reasons as the .task: no CDN
+// dependency at demo time, and a version pinned to what was validated.
+// Resolved relative to index.html (the page), not to this module.
+export const MEDIAPIPE_WASM_URL = "vendor/mediapipe/wasm";
