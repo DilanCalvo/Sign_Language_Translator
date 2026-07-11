@@ -1,7 +1,16 @@
 # Netlify deploy for the web version (static site, no build step).
 # Connect the repo in the Netlify UI and it picks this file up automatically.
+#
+# base = "web" matters: without it, Netlify scans the WHOLE repo for manifest
+# files to auto-install (package.json, requirements.txt, ...) before it even
+# looks at `publish`. It finds the desktop app's root-level requirements.txt
+# and tries `pip install` on Linux — which fails on pywin32 (Windows-only) and
+# would be pure waste even if it succeeded, since this static site needs no
+# Python at all. Scoping the base directory to web/ (which has no manifest
+# files of its own) stops that phase from running in the first place.
 [build]
-  publish = "web"
+  base = "web"
+  publish = "."
 
 # Cache policy. The model/labels/fixtures/JS keep the same filenames across
 # redeploys, so browsers must REVALIDATE them on each visit (no-cache = cheap
