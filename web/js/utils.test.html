@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Parity tests — web port</title>
+<style>
+  body { font-family: ui-monospace, Consolas, monospace; background: #111; color: #ddd;
+         max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.1rem; } h2 { font-size: 0.95rem; margin-top: 1.5rem; }
+  .pass { color: #4c1; } .fail { color: #f55; } .warn { color: #fa3; }
+  li { margin: 2px 0; } #summary { font-size: 1.2rem; margin-top: 1.5rem; }
+</style>
+</head>
+<body>
+<h1>Parity tests: JS port vs Python (fixtures from real capture data)</h1>
+<p>Serve over HTTP (e.g. <code>python -m http.server</code> from <code>web/</code>),
+   then open <code>/js/utils.test.html</code>. Everything must be PASS before
+   touching the live pipeline.</p>
+<div id="results"></div>
+<div id="summary">running…</div>
+
+<script type="module">
+import { normalizeLandmarks, PredictionSmoother, LetterBuffer } from "./utils.js";
+import { loadLettersModel } from "./model.js";
+
+const results = document.getElementById("results");
+let nPass = 0, nFail = 0;
+
+function section(title) {
+  const h = document.createElement("h2");
+  h.textContent = title;
+  results.appendChild(h);
+  const ul = document.createElement("ul");
+  results.appendChild(ul);
+  return ul;
+}
+
+function report(ul, name, ok, detail = "") {
+  const li = document.createElement("li");
+  li.className = ok ? "pass" : "fail";
+  li.textContent = `${ok ? "PASS" : "FAIL"}  ${name}${detail ? "  — " + detail : ""}`;
+  ul.appendChild(li);
+  ok ? nPass++ : nFail++;
+}
+
+function maxAbsDiff(a, b) {
+  let m = 0;
+  for (let i = 0; i < a.length; i++) m = Math.max(m, Math.abs(a[i] - b[i]));
+  return m;
+}
+
+// ---- 1. normalizeLandmarks vs Python (tolerance 1e-5) ----
+{
+  const ul = section("normalizeLandmarks — vs Python normalize_landmarks");
+  const cases = await (await fetch("../fixtures/normalize_fixtures.json")).json();
+  for (const c of cases) {
+    const got = normalizeLandmarks(c.input);
+    const diff = maxAbsDiff(got, c.expected);
+    report(ul, `case ${c.label}`, diff < 1e-5, `max diff ${diff.toExponential(2)}`);
+  }
+}
+
+// ---- 2. Model forward pass vs Python .h5 (tolerance 1e-4 on softmax) ----
+{
+  const ul = section("LettersModel — vs Python model_one_hand.h5 softmax");
+  try {
+    const model = await loadLettersModel("../model/letters/model_weights.json");
+    const cases = await (await fetch("../fixtures/model_fixtures.json")).json();
+    for (const c of cases) {
+      const probs = model.predict(Float32Array.from(c.input));
+      const diff = maxAbsDiff(probs, c.expected_probs);
+      const argmax = probs.indexOf(Math.max(...probs));
+      const expArgmax = c.expected_probs.indexOf(Math.max(...c.expected_probs));
+      report(ul, `case ${c.label}`, diff < 1e-4 && argmax === expArgmax,
+             `max prob diff ${diff.toExponential(2)}, argmax ${argmax}${argmax === expArgmax ? "" : " != " + expArgmax}`);
+    }
+  } catch (e) {
+    report(ul, "load model_weights.json", false, e.message);
+  }
+}
+
+// ---- 3. PredictionSmoother behavior (mirrors Python semantics) ----
+{
+  const ul = section("PredictionSmoother — behavioral");
+  let s = new PredictionSmoother(7, 5);
+  ["A","A","A","A","A"].forEach((p) => s.update(p));
+  report(ul, "5xA in window of 7 -> stable A", s.getStable() === "A");
+
+  s = new PredictionSmoother(7, 5);
+  ["A","A","A","A",null,null,null].forEach((p) => s.update(p));
+  report(ul, "4xA + 3xnull -> null (nulls count against)", s.getStable() === null);
+
+  s = new PredictionSmoother(7, 5);
+  ["A","A","A","A","A","B","B","B"].forEach((p) => s.update(p));
+  // window keeps last 7: A A A A B B B -> A has 4 votes < 5
+  report(ul, "letter change flushes old votes", s.getStable() === null);
+
+  s = new PredictionSmoother(7, 5);
+  report(ul, "empty buffer -> null", s.getStable() === null);
+  s.update("A"); s.reset();
+  report(ul, "reset clears buffer", s.getStable() === null);
+}
+
+// ---- 4. LetterBuffer behavior (mirrors src/overlay.py) ----
+{
+  const ul = section("LetterBuffer — behavioral");
+  const b = new LetterBuffer(3);
+  const accepted1 = b.update("a");
+  const accepted2 = b.update("B"); // still cooling down
+  report(ul, "first letter accepted, uppercased", accepted1 && b.getText() === "A");
+  report(ul, "second letter rejected during cooldown", !accepted2);
+  b.update(null); b.update(null); // cooldown ticks down
+  const accepted3 = b.update("B");
+  report(ul, "letter accepted after cooldown", accepted3 && b.getText() === "AB");
+  b.clear();
+  report(ul, "clear empties strip", b.getText() === "");
+}
+
+const s = document.getElementById("summary");
+s.className = nFail === 0 ? "pass" : "fail";
+s.textContent = nFail === 0
+  ? `ALL ${nPass} TESTS PASS`
+  : `${nFail} FAILED / ${nPass} passed`;
+</script>
+</body>
+</html>

@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign Language Translator — ASL letters</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #14161a; color: #e8e8e8;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 1rem; gap: 0.9rem;
+  }
+  h1 { font-size: 1.05rem; font-weight: 600; color: #aab; }
+  h1 span { color: #ffd900; }
+
+  #stage { position: relative; width: min(100%, 640px); }
+  #view {
+    width: 100%; border-radius: 12px; background: #000;
+    aspect-ratio: 16 / 9; display: block;
+  }
+  #status {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    background: rgba(0,0,0,0.65); padding: 0.5rem 1rem; border-radius: 8px;
+    font-size: 0.95rem; text-align: center; max-width: 90%;
+  }
+  #status.error { color: #ff7b6b; }
+  #status.hidden { display: none; }
+  #fps {
+    position: absolute; top: 8px; right: 10px; font-size: 0.7rem;
+    color: #8a8; background: rgba(0,0,0,0.4); padding: 2px 6px; border-radius: 4px;
+  }
+
+  #readout { display: flex; align-items: center; gap: 1.2rem; }
+  #letter {
+    font-size: 4.5rem; font-weight: 700; min-width: 5.5rem; text-align: center;
+    color: #fff; line-height: 1;
+  }
+  #conf-wrap { width: 180px; }
+  #conf-track {
+    height: 14px; background: #333; border-radius: 7px; overflow: hidden;
+  }
+  #conf-bar { height: 100%; width: 0; transition: width 120ms; }
+  #conf-bar.good { background: #35c24d; }
+  #conf-bar.mid  { background: #e0c530; }
+  #conf-bar.low  { background: #d64541; }
+  #conf-label { font-size: 0.8rem; color: #999; margin-top: 4px; }
+
+  #alternatives {
+    display: flex; gap: 0.8rem; font-size: 0.95rem; color: #ccc;
+    background: #22252b; padding: 0.45rem 0.9rem; border-radius: 8px;
+  }
+  #alternatives.hidden { display: none; }
+  #alternatives::before { content: "unsure — top 3:"; color: #888; }
+
+  #strip-row { display: flex; align-items: center; gap: 0.8rem; width: min(100%, 640px); }
+  #strip {
+    flex: 1; min-height: 2.4rem; background: #0d2136; border-radius: 8px;
+    padding: 0.5rem 0.8rem; font-size: 1.3rem; letter-spacing: 0.15em;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  #clear {
+    background: #2b2f36; color: #ccc; border: 1px solid #444;
+    border-radius: 8px; padding: 0.5rem 1rem; font-size: 0.9rem; cursor: pointer;
+  }
+  #clear:hover { background: #383d46; }
+
+  footer { font-size: 0.75rem; color: #667; text-align: center; max-width: 640px; }
+</style>
+</head>
+<body>
+  <h1>Sign Language Translator <span>— ASL letters, in your browser</span></h1>
+
+  <div id="stage">
+    <canvas id="view"></canvas>
+    <div id="status">loading…</div>
+    <div id="fps"></div>
+  </div>
+
+  <div id="readout">
+    <div id="letter">–</div>
+    <div id="conf-wrap">
+      <div id="conf-track"><div id="conf-bar"></div></div>
+      <div id="conf-label"></div>
+    </div>
+  </div>
+
+  <div id="alternatives" class="hidden"></div>
+
+  <div id="strip-row">
+    <div id="strip"></div>
+    <button id="clear">Clear</button>
+  </div>
+
+  <footer>
+    Static ASL letters A–Y (J and Z need motion — desktop version roadmap).
+    Everything runs locally in your browser; no video leaves your device.
+  </footer>
+
+  <script type="module" src="js/pipeline.js"></script>
+</body>
+</html>

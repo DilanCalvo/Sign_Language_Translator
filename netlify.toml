@@ -1,0 +1,4 @@
+# Netlify deploy for the web version (static site, no build step).
+# Connect the repo in the Netlify UI and it picks this file up automatically.
+[build]
+  publish = "web"
