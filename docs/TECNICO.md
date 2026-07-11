@@ -244,12 +244,16 @@ data/real_capture/
 └── words/     → seq/*.npy (secuencias) + manifest.csv
 ```
 
-1. **Capturar** (`capture/capture_letters.py`, `capture/capture_words.py`): graba
-   muestras. Las palabras se guardan como una secuencia `.npy` por toma más un
-   `manifest.csv`. Re-ejecutar **agrega** muestras (dataset multi-sesión).
-2. **Entrenar** (`training/train_letters.py`, `training/train_words.py`): el
-   entrenador de palabras lee el `manifest.csv` directamente (sin editar rutas) y
-   produce el `.h5`.
+1. **Capturar** (`capture/capture_letters.py`, `capture/capture_numbers.py`,
+   `capture/capture_words.py`): graba muestras. Las palabras se guardan como una
+   secuencia `.npy` por toma más un `manifest.csv`. Re-ejecutar **agrega**
+   muestras (dataset multi-sesión).
+2. **Entrenar** (`training/train_letters.py`, `training/train_numbers.py`,
+   `training/train_words.py`): cada entrenador descubre sus datos solo (las
+   palabras leen el `manifest.csv`; letras y números toman todos los CSV de su
+   carpeta — sin editar rutas) y produce el `.h5`. Cada corrida deja un registro
+   comparable en `runs/<modelo>_<timestamp>.json` (datos, sesiones, accuracy,
+   configuración, git SHA).
 3. **Usar** (`main.py`): carga los modelos y clasifica en tiempo real.
 
 ### Disciplina multi-sesión (decisión importante)

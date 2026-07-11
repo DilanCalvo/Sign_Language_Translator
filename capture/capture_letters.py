@@ -241,8 +241,9 @@ def main():
         print(f"    {lbl:>6}: {cnt:>4}  [{bar:<20}]")
     print(f"{'=' * 55}")
     print(f"\nFile saved to: {output_path}")
-    print(f"\nTo include it in training, add this path to DATA_CSVS in")
-    print(f"training/train_letters.py.")
+    print("\nTrain now: python training/train_letters.py")
+    print("(the trainer auto-discovers every CSV here, so just re-run this")
+    print(" script on other days to add sessions -- no code to edit.)")
 
 
 if __name__ == "__main__":

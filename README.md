@@ -166,11 +166,13 @@ reliable word recognition.
 
 ### 2. Train
 
-The word trainer reads `data/real_capture/words/manifest.csv` directly — no
-paths to edit. (The letter trainer still uses its `DATA_CSVS` list.)
+Every trainer discovers its data automatically — no paths to edit. The word
+trainer reads `data/real_capture/words/manifest.csv`; the letter and number
+trainers pick up every CSV in their capture directory.
 
 ```bash
 python training/train_letters.py     # produces model/model_one_hand.h5
+python training/train_numbers.py     # produces model/model_numbers.h5
 python training/train_words.py       # produces model/model_words.h5 (TCN)
 ```
 

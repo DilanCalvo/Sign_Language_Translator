@@ -30,6 +30,7 @@ import glob
 import json
 import os
 import sys
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -43,6 +44,7 @@ from tensorflow.keras import callbacks, layers, models, regularizers
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.utils import normalize_landmarks
+from training.run_log import write_run_metadata
 from config import (
     MODEL_NUMBERS_PATH  as MODEL_OUT,
     LABELS_NUMBERS_PATH as LABELS_OUT,
@@ -65,7 +67,10 @@ _MIRROR_MASK_63 = tf.constant(
 )
 
 
-def _load_data(data_dir) -> tuple[np.ndarray, np.ndarray]:
+def _load_data(data_dir) -> tuple[np.ndarray, np.ndarray, int]:
+    """Load every capture CSV in `data_dir`. Returns (X, labels, n_files);
+    n_files doubles as the session count for the run record (one capture run
+    writes one timestamped file)."""
     paths = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
     if not paths:
         print(f"[ERROR] No CSV found in {data_dir}/. "
@@ -84,7 +89,7 @@ def _load_data(data_dir) -> tuple[np.ndarray, np.ndarray]:
     labels = np.array([str(v) for v in df["label"].tolist()])
     raw = df.drop(columns=["label"]).to_numpy(dtype=np.float32)
     normalized = np.stack([normalize_landmarks(row) for row in raw])
-    return normalized, labels
+    return normalized, labels, len(paths)
 
 
 def _augment(x, y):
@@ -192,7 +197,7 @@ def main():
     tf.random.set_seed(SEED)
 
     print("Loading and normalizing data...")
-    x_all, y_all_str = _load_data(DATA_DIR)
+    x_all, y_all_str, n_files = _load_data(DATA_DIR)
 
     try:
         x_train, x_val, y_train_str, y_val_str = train_test_split(
@@ -240,6 +245,16 @@ def main():
     labels_dict = {str(i): name for i, name in enumerate(encoder.classes_)}
     with open(LABELS_OUT, "w", encoding="utf-8") as f:
         json.dump(labels_dict, f, indent=2, ensure_ascii=False)
+
+    write_run_metadata(
+        "numbers", list(encoder.classes_),
+        samples_per_class=Counter(y_all_str.tolist()),
+        n_sessions=n_files,
+        val_accuracy=val_acc,
+        config={"epochs": EPOCHS, "batch_size": BATCH_SIZE,
+                "noise_stddev": NOISE_STDDEV, "scale_jitter": SCALE_JITTER,
+                "l2": L2, "seed": SEED},
+    )
 
     print(f"\nModel saved to:  {MODEL_OUT}")
     print(f"Labels saved to: {LABELS_OUT}")

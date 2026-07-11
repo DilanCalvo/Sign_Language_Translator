@@ -2,7 +2,9 @@
 One-hand (letter) model training.
 
 Input:
-    CSVs captured with capture/capture_letters.py
+    Every CSV in data/real_capture/letters/ (auto-discovered). Capture more with
+    capture/capture_letters.py and just re-run this — no paths to edit, so a
+    multi-session dataset (different days / lighting / distance) is frictionless.
 
 Output:
     model/model_one_hand.h5         (best model by val_accuracy)
@@ -18,9 +20,11 @@ Strategy:
     - EarlyStopping + ReduceLROnPlateau + ModelCheckpoint.
 """
 
+import glob
 import json
 import os
 import sys
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -34,26 +38,15 @@ from tensorflow.keras import callbacks, layers, models, regularizers
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.utils import normalize_landmarks
+from training.run_log import write_run_metadata
 
 
 MODEL_OUT  = "model/model_one_hand.h5"
 LABELS_OUT = "model/labels_one_hand.json"
 
-# CSVs captured with capture/capture_letters.py.
-# Can be a single path (str) or a list of paths (list).
-DATA_CSVS = [
-    "data/real_capture/letters/capture_20260520_180454_A-B-C.csv",
-    "data/real_capture/letters/capture_20260520_143836_D-E-F.csv",
-    "data/real_capture/letters/capture_20260520_145116_G-H-I-.csv",
-    "data/real_capture/letters/capture_20260520_173739_I-K-L.csv",
-    "data/real_capture/letters/capture_20260520_174943_M-N-O.csv",
-    "data/real_capture/letters/capture_20260520_182414_P-Q-R.csv",
-    "data/real_capture/letters/capture_20260520_184531_S-T-U.csv",
-    "data/real_capture/letters/capture_20260520_204902_V-W-X.csv",
-    "data/real_capture/letters/capture_20260521_212857_Y.csv"
-    # Add new capture sessions here:
-    # "data/real_capture/letters/capture_YYYYMMDD_HHMMSS_XYZ.csv",
-]
+# Directory scanned for capture CSVs. Every *.csv here is used, so adding a
+# session is just re-running capture/capture_letters.py (no code change).
+DATA_DIR = "data/real_capture/letters"
 
 EXCLUDED_CLASSES = {"nothing"}
 
@@ -70,27 +63,28 @@ _MIRROR_MASK_63 = tf.constant(
 )
 
 
-def _load_data(csvs) -> tuple[np.ndarray, np.ndarray]:
-    paths = [csvs] if isinstance(csvs, str) else csvs
+def _load_data(data_dir) -> tuple[np.ndarray, np.ndarray, int]:
+    """Load every capture CSV in `data_dir`. Returns (X, labels, n_files);
+    n_files doubles as the session count for the run record (one capture run
+    writes one timestamped file)."""
+    paths = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
+    if not paths:
+        print(f"[ERROR] No CSV found in {data_dir}/. "
+              "Capture first: python capture/capture_letters.py")
+        raise SystemExit(1)
+
     frames = []
     for p in paths:
-        if p and os.path.isfile(p):
-            df = pd.read_csv(p)
-            frames.append(df)
-            print(f"  + {len(df):,} samples from {p}")
-        elif p:
-            print(f"  [WARN] File not found: {p}")
-
-    if not frames:
-        print("[ERROR] No CSV found. Check DATA_CSVS.")
-        raise SystemExit(1)
+        df = pd.read_csv(p)
+        frames.append(df)
+        print(f"  + {len(df):,} samples from {p}")
 
     df = pd.concat(frames, ignore_index=True)
     df = df[~df["label"].isin(EXCLUDED_CLASSES)].reset_index(drop=True)
-    labels = np.array(df["label"].tolist())
+    labels = np.array([str(v) for v in df["label"].tolist()])
     raw = df.drop(columns=["label"]).to_numpy(dtype=np.float32)
     normalized = np.stack([normalize_landmarks(row) for row in raw])
-    return normalized, labels
+    return normalized, labels, len(paths)
 
 
 def _augment(x, y):
@@ -198,7 +192,7 @@ def main():
     tf.random.set_seed(SEED)
 
     print("Loading and normalizing data...")
-    x_all, y_all_str = _load_data(DATA_CSVS)
+    x_all, y_all_str, n_files = _load_data(DATA_DIR)
 
     try:
         x_train, x_val, y_train_str, y_val_str = train_test_split(
@@ -246,6 +240,16 @@ def main():
     labels_dict = {str(i): name for i, name in enumerate(encoder.classes_)}
     with open(LABELS_OUT, "w", encoding="utf-8") as f:
         json.dump(labels_dict, f, indent=2, ensure_ascii=False)
+
+    write_run_metadata(
+        "letters", list(encoder.classes_),
+        samples_per_class=Counter(y_all_str.tolist()),
+        n_sessions=n_files,
+        val_accuracy=val_acc,
+        config={"epochs": EPOCHS, "batch_size": BATCH_SIZE,
+                "noise_stddev": NOISE_STDDEV, "scale_jitter": SCALE_JITTER,
+                "l2": L2, "seed": SEED},
+    )
 
     print(f"\nModel saved to:  {MODEL_OUT}")
     print(f"Labels saved to: {LABELS_OUT}")

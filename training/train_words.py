@@ -30,10 +30,8 @@ Usage:
 import csv
 import json
 import os
-import subprocess
 import sys
 from collections import Counter
-from datetime import datetime
 
 import numpy as np
 
@@ -45,7 +43,8 @@ from config import (
     MODEL_WORDS_PATH   as MODEL_OUT,
     LABELS_WORDS_PATH  as LABELS_OUT,
 )
-from src.utils import mirror_word_sequence
+from src.utils import mirror_word_sequence, resample_sequence
+from training.run_log import write_run_metadata
 
 HERE     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(HERE, _DATA_DIR)
@@ -159,10 +158,29 @@ def _hand_dropout(seq, rng):
     return out
 
 
+def _temporal_crop(seq, rng):
+    """Drop 10-25% of the frames from the start OR the end, then resample back
+    to T — a misaligned live window (the rolling buffer slides mid-sign, unlike
+    the aligned SPACE->stop capture takes).
+
+    NOT APPLIED. Measured 2026-07-09 on 612 takes / 6 sessions: adding this as a
+    9th offline variant dropped session-grouped CV from 94.1% to 93.0% and
+    `nothing` recall from 0.76 to 0.74 — every multi-class fold got ~1.2pp worse.
+    The aligned-takes CV can't see any live-misalignment benefit, but it does
+    price the cost, and the cost was real. Kept (unused) so the experiment isn't
+    blindly repeated; revisit only with an eval that scores misaligned windows."""
+    frac = rng.uniform(0.10, 0.25)
+    cut = max(1, int(len(seq) * frac))
+    cropped = seq[cut:] if rng.integers(2) else seq[:-cut]
+    return resample_sequence(cropped, T)
+
+
 def _offline_augment(X, y):
     """Enlarge the tiny dataset with structural variants applied once before
     training: mirror, time-warp (pace) and detector-failure (dropped frames /
-    a hand leaving the frame). Per-batch jitter is added separately in tf.data."""
+    a hand leaving the frame). Per-batch jitter is added separately in tf.data.
+    (_temporal_crop was tried and measured as a net regression — see its
+    docstring — so it is deliberately not in this list.)"""
     rng = np.random.default_rng(SEED)
     variants = [X, np.stack([mirror_word_sequence(s) for s in X])]
     for g in (0.7, 1.4):
@@ -264,46 +282,6 @@ def _build_model(num_classes):
     return model
 
 
-def _git_sha():
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"], cwd=HERE,
-            capture_output=True, text=True, check=True).stdout.strip()
-    except Exception:
-        return "unknown"
-
-
-def _write_run_metadata(glosses, groups, y, val_acc):
-    """Append a one-file record of this training run so model iterations are
-    comparable (which vocab, how many sessions, what accuracy, which config).
-    Lightweight on purpose: one JSON per run under runs/, version it in git."""
-    runs_dir = os.path.join(HERE, "runs")
-    os.makedirs(runs_dir, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    per_class = Counter(glosses[i] for i in y)
-    record = {
-        "timestamp": stamp,
-        "git_sha": _git_sha(),
-        "vocab": glosses,
-        "n_classes": len(glosses),
-        "n_sessions": len(set(groups.tolist())),
-        "n_samples": int(len(y)),
-        "samples_per_class": dict(sorted(per_class.items())),
-        "val_accuracy": round(float(val_acc), 4) if val_acc is not None else None,
-        "config": {
-            "WORD_SEQ_LEN": T,
-            "WORD_FEATURE_DIM": FEATURE_DIM,
-            "epochs": EPOCHS,
-            "batch_size": BATCH_SIZE,
-            "lr": LR,
-        },
-    }
-    path = os.path.join(runs_dir, f"{stamp}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(record, f, indent=2, ensure_ascii=False)
-    print(f"Run    -> runs/{stamp}.json")
-
-
 def main():
     import tensorflow as tf
 
@@ -333,7 +311,7 @@ def main():
 
     print(f"Vocabulary ({num_classes}): {', '.join(glosses)}")
     print(f"  sessions {n_sessions}  train {len(Xtr)}  val {len(Xva)}  "
-          "(x6 after offline augmentation)")
+          "(x8 after offline augmentation)")
     if n_sessions < 2:
         print("  [WARN] Only one capture session, so validation is empty: holding "
               "out whole sessions is the only leak-free split, and there is no "
@@ -365,7 +343,14 @@ def main():
     with open(os.path.join(HERE, LABELS_OUT), "w", encoding="utf-8") as f:
         json.dump({str(i): g for g, i in label_to_idx.items()},
                   f, indent=2, ensure_ascii=False)
-    _write_run_metadata(glosses, groups, y, val_acc)
+    write_run_metadata(
+        "words", glosses,
+        samples_per_class=Counter(glosses[i] for i in y),
+        n_sessions=len(set(groups.tolist())),
+        val_accuracy=val_acc,
+        config={"WORD_SEQ_LEN": T, "WORD_FEATURE_DIM": FEATURE_DIM,
+                "epochs": EPOCHS, "batch_size": BATCH_SIZE, "lr": LR},
+    )
 
     print(f"Model  -> {MODEL_OUT}")
     print(f"Labels -> {LABELS_OUT}")
