@@ -20,7 +20,8 @@ host it requires HTTPS — Netlify provides that automatically.
 
 ```
 index.html          UI: camera view, letter + confidence bar, top-3 hints,
-                    spelling strip
+                    spelling strip, camera picker (appears only with 2+
+                    cameras; the choice persists in localStorage)
 js/config.js        Tunables COPIED from ../config.py (see rule 3 below)
 js/utils.js         Port of normalize_landmarks / PredictionSmoother / LetterBuffer
 js/model.js         Loads model/letters/model_weights.json and runs the

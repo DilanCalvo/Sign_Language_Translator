@@ -56,6 +56,7 @@ const els = {
   strip: document.getElementById("strip"),
   clearBtn: document.getElementById("clear"),
   fps: document.getElementById("fps"),
+  cameraSel: document.getElementById("camera-select"),
 };
 const ctx = els.canvas.getContext("2d");
 
@@ -236,6 +237,94 @@ function startLoop() {
   }
 }
 
+// ---- Camera selection ----
+// With several cameras connected the browser picks one on its own; the
+// selector lets the user pick (and keep, via localStorage) the right one.
+// Mirrors the desktop app's CAMERA_INDEX in config.py, but switchable live.
+const CAMERA_STORE_KEY = "asl-web.cameraDeviceId";
+
+/**
+ * Acquire (or re-acquire) the camera and attach it to the shared <video>
+ * element. The frame loop keeps referencing that same element, so a camera
+ * switch never needs to touch the loop. deviceId null = browser default.
+ */
+async function startCamera(deviceId) {
+  if (video.srcObject) {
+    for (const t of video.srcObject.getTracks()) t.stop();
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: "user" }),
+      width: { ideal: 960 },
+      height: { ideal: 540 },
+    },
+    audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+
+  els.canvas.width = video.videoWidth;
+  els.canvas.height = video.videoHeight;
+  // The CSS 16:9 aspect is only a pre-camera placeholder; cameras differ
+  // (and may differ between each other) — never stretch the image.
+  els.canvas.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+}
+
+function currentCameraId() {
+  const track = video.srcObject && video.srcObject.getVideoTracks()[0];
+  return track ? track.getSettings().deviceId : null;
+}
+
+/** Populate the selector. Hidden unless there is a real choice (2+ cameras). */
+async function refreshCameraList() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = devices.filter((d) => d.kind === "videoinput");
+  if (cams.length < 2) {
+    els.cameraSel.classList.add("hidden");
+    return;
+  }
+  const activeId = currentCameraId();
+  els.cameraSel.innerHTML = "";
+  cams.forEach((cam, i) => {
+    const opt = document.createElement("option");
+    opt.value = cam.deviceId;
+    // Labels are only exposed once camera permission is granted; the numbered
+    // fallback covers browsers that still withhold them.
+    opt.textContent = cam.label || `Camera ${i + 1}`;
+    opt.selected = cam.deviceId === activeId;
+    els.cameraSel.appendChild(opt);
+  });
+  els.cameraSel.classList.remove("hidden");
+}
+
+els.cameraSel.addEventListener("change", async () => {
+  const previousId = currentCameraId();
+  const newId = els.cameraSel.value;
+  els.cameraSel.disabled = true;
+  setStatus("switching camera…");
+  try {
+    await startCamera(newId);
+    localStorage.setItem(CAMERA_STORE_KEY, newId);
+    // Fresh camera, fresh votes — but the spelled strip is the user's work
+    // and survives the switch on purpose.
+    smoother.reset();
+    setStatus("waiting for hand…");
+  } catch (err) {
+    // Demo safety: failing to switch must not leave the app with NO camera.
+    // Restore the previous one; only if that also fails, give up honestly.
+    console.error("Camera switch failed:", err);
+    try {
+      await startCamera(previousId);
+      els.cameraSel.value = previousId;
+      setStatus("could not switch camera — kept the previous one", true);
+    } catch {
+      setStatus("Camera unavailable. Reload the page to retry.", true);
+    }
+  } finally {
+    els.cameraSel.disabled = false;
+  }
+});
+
 // ---- Boot ----
 async function main() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -273,21 +362,26 @@ async function main() {
     drawer = new DrawingUtils(ctx);
 
     setStatus("requesting camera…");
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "user", width: { ideal: 960 }, height: { ideal: 540 } },
-      audio: false,
-    });
     video = document.createElement("video");
-    video.srcObject = stream;
     video.playsInline = true; // iOS: play inline instead of fullscreen
     video.muted = true;
-    await video.play();
 
-    els.canvas.width = video.videoWidth;
-    els.canvas.height = video.videoHeight;
-    // The CSS 16:9 aspect is only a pre-camera placeholder; the real camera
-    // may be 4:3 (typical on phones) and must not be stretched.
-    els.canvas.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+    // Prefer the camera the user picked last time; if it is gone (unplugged)
+    // fall back to the default instead of dying. A permission error is not a
+    // device problem, so it does not clear the saved choice.
+    const savedId = localStorage.getItem(CAMERA_STORE_KEY);
+    try {
+      await startCamera(savedId);
+    } catch (err) {
+      if (!savedId || err.name === "NotAllowedError") throw err;
+      localStorage.removeItem(CAMERA_STORE_KEY);
+      await startCamera(null);
+    }
+
+    // Device labels only exist after permission was granted, so the selector
+    // is built now, not at page load. Refresh it if cameras (un)plug.
+    await refreshCameraList();
+    navigator.mediaDevices.addEventListener("devicechange", refreshCameraList);
 
     setStatus("waiting for hand…");
     startLoop();
