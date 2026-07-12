@@ -14,31 +14,42 @@ _WRIST = 0          # wrist landmark (used as the origin)
 _MIDDLE_MCP = 9     # base of the middle finger (used as the scale reference)
 
 
-def normalize_landmarks(flat):
+def normalize_landmarks(flat, aspect=None):
     """
     Normalize one landmark sample.
 
     Accepts:
-        flat: array/list of 63 floats (one hand) or 126 floats (two hands).
-              Each hand is 21 consecutive points (x, y, z).
+        flat:   array/list of 63 floats (one hand) or 126 floats (two hands).
+                Each hand is 21 consecutive points (x, y, z).
+        aspect: frame width / height the landmarks came from, or None.
+                MediaPipe normalizes x by the frame WIDTH and y by the frame
+                HEIGHT (z scales like x, per the official docs), so the same
+                physical pose yields a differently-stretched vector on a 16:9
+                webcam vs a 9:16 portrait phone. When aspect is given, the
+                stretch is undone ("width units": y /= aspect; x and z
+                untouched) BEFORE centering/scaling, making the result
+                orientation-invariant. None skips the correction — only
+                legitimate for the word pipeline, whose stored training
+                features predate it.
 
     Returns:
         np.ndarray float32 of the same size, already normalized.
 
     Per-hand process:
-        1. Center the 21 points by subtracting the wrist position.
-        2. Scale by the wrist -> middle-finger-base distance. This makes the
+        1. Undo MediaPipe's per-axis stretch (when aspect is given).
+        2. Center the 21 points by subtracting the wrist position.
+        3. Scale by the wrist -> middle-finger-base distance. This makes the
            model robust to large/small hands and to hands near/far from the
            camera.
     """
     arr = np.asarray(flat, dtype=np.float32)
 
     if arr.size == 63:
-        return _normalize_single(arr)
+        return _normalize_single(arr, aspect)
 
     if arr.size == 126:
-        h1 = _normalize_single(arr[:63])
-        h2 = _normalize_single(arr[63:])
+        h1 = _normalize_single(arr[:63], aspect)
+        h2 = _normalize_single(arr[63:], aspect)
         return np.concatenate([h1, h2]).astype(np.float32)
 
     raise ValueError(
@@ -46,8 +57,14 @@ def normalize_landmarks(flat):
     )
 
 
-def _normalize_single(flat63):
+def _normalize_single(flat63, aspect=None):
     points = flat63.reshape(21, 3)
+    if aspect is not None:
+        # Copy: the un-stretch must not mutate the caller's array (loaders pass
+        # views into a shared matrix). It commutes with the centering below but
+        # NOT with the scale norm, so it must happen first.
+        points = points.copy()
+        points[:, 1] /= np.float32(aspect)
     centered = points - points[_WRIST]
     scale = np.linalg.norm(centered[_MIDDLE_MCP])
     if scale < 1e-6:

@@ -417,6 +417,25 @@ POSE_LANDMARKER_PATH  = "model/pose_landmarker_lite.task"
 
 CAMERA_INDEX = 0
 
+# Aspect ratio (width / height) assumed for capture CSVs that predate the
+# per-row "aspect" column.
+#
+# WHY THIS EXISTS: MediaPipe normalizes each landmark axis independently —
+# x by the frame WIDTH and y by the frame HEIGHT (z uses roughly the same
+# scale as x, per the official docs). The same physical hand pose therefore
+# produces a differently-stretched landmark vector on a 16:9 desktop webcam
+# vs. a 9:16 portrait phone. normalize_landmarks undoes that stretch using
+# the frame's aspect ratio ("width units": y /= aspect; x and z untouched),
+# making the features orientation-invariant.
+#
+# Legacy capture data (May 2026) was recorded before the aspect was stored:
+# a single desktop webcam, verified 16:9 (1920x1080 physical cam and the
+# 1280x720 virtual cam both probed at 1.7778). Loaders apply this constant
+# to any CSV row without an "aspect" column. New captures record the real
+# per-frame value, so this constant only ever applies to that legacy data.
+
+LEGACY_CAPTURE_ASPECT = 16 / 9
+
 # Minimum confidence to detect a hand for the first time in the frame.
 #
 #   Raise → ignores doubtful detections; fewer initial false positives.

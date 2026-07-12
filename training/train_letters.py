@@ -22,14 +22,12 @@ Strategy:
     - EarlyStopping + ReduceLROnPlateau + ModelCheckpoint.
 """
 
-import glob
 import json
 import os
 import sys
 from collections import Counter
 
 import numpy as np
-import pandas as pd
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -39,7 +37,7 @@ import tensorflow as tf
 from tensorflow.keras import callbacks, layers, models, regularizers
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.utils import normalize_landmarks
+from config import LEGACY_CAPTURE_ASPECT
 from training.run_log import write_run_metadata
 
 
@@ -77,25 +75,21 @@ _MIRROR_MASK_63 = tf.constant(
 def _load_data(data_dir) -> tuple[np.ndarray, np.ndarray, int]:
     """Load every capture CSV in `data_dir`. Returns (X, labels, n_files);
     n_files doubles as the session count for the run record (one capture run
-    writes one timestamped file)."""
-    paths = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
-    if not paths:
+    writes one timestamped file).
+
+    Thin wrapper over eval_common.load_static_csv_dir — the single parser of
+    the capture-CSV format (handles the optional "aspect" column and the
+    legacy aspect-ratio correction). Keeping one parser means training and
+    evaluation can never disagree on how a CSV row becomes a feature vector.
+    """
+    from training.eval_common import load_static_csv_dir
+
+    X, labels, groups = load_static_csv_dir(data_dir, excluded=EXCLUDED_CLASSES)
+    if len(X) == 0:
         print(f"[ERROR] No CSV found in {data_dir}/. "
               "Capture first: python capture/capture_letters.py")
         raise SystemExit(1)
-
-    frames = []
-    for p in paths:
-        df = pd.read_csv(p)
-        frames.append(df)
-        print(f"  + {len(df):,} samples from {p}")
-
-    df = pd.concat(frames, ignore_index=True)
-    df = df[~df["label"].isin(EXCLUDED_CLASSES)].reset_index(drop=True)
-    labels = np.array([str(v) for v in df["label"].tolist()])
-    raw = df.drop(columns=["label"]).to_numpy(dtype=np.float32)
-    normalized = np.stack([normalize_landmarks(row) for row in raw])
-    return normalized, labels, len(paths)
+    return X, labels, len(np.unique(groups))
 
 
 def _random_rotation(x):
@@ -304,6 +298,8 @@ def main():
                 "rotation_max_deg_roll": ROTATION_MAX_DEG_ROLL,
                 "rotation_max_deg_pitch_yaw": ROTATION_MAX_DEG_PITCH_YAW,
                 "label_smoothing": LABEL_SMOOTHING,
+                "aspect_corrected": True,
+                "legacy_capture_aspect": round(LEGACY_CAPTURE_ASPECT, 4),
                 "l2": L2, "seed": SEED},
     )
 

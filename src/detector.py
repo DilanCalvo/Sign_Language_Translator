@@ -91,6 +91,9 @@ class Detector:
                 "hands_by_side": {"Left": list|None, "Right": list|None},  # words
                 "shoulder_l": (x, y) | None,            # body anchor (words)
                 "shoulder_r": (x, y) | None,
+                "frame_aspect": float | None,           # frame width/height — lets
+                                                        # normalize_landmarks undo
+                                                        # MediaPipe's per-axis stretch
             }
         """
         ret, frame = self._cap.read()
@@ -105,6 +108,8 @@ class Detector:
         pose_result = self._pose.detect_for_video(mp_image, timestamp_ms) if self._pose else None
 
         landmarks_data = self._extract_landmarks(result, pose_result)
+        # shape is (h, w); the flip above does not change dimensions.
+        landmarks_data["frame_aspect"] = frame.shape[1] / frame.shape[0]
         self._draw_landmarks(frame, result)
         self._draw_pose(frame, landmarks_data)
 
@@ -187,6 +192,7 @@ class Detector:
             "hands_by_side": {"Left": None, "Right": None},
             "shoulder_l": None,
             "shoulder_r": None,
+            "frame_aspect": None,
         }
 
     def release(self):

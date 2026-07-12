@@ -172,6 +172,12 @@ class Classifier:
         """
         num_hands = landmarks_data["num_hands"]
         h1 = landmarks_data["landmarks_hand1"]
+        # Frame aspect (width/height) for the per-axis un-stretch in
+        # normalize_landmarks. None means a legacy caller without frame info —
+        # only legitimate for the word pipeline, whose stored training data
+        # predates the correction; the static models REQUIRE it to match how
+        # they were trained.
+        aspect = landmarks_data.get("frame_aspect")
 
         if num_hands == 0 or h1 is None:
             self._word_buffer.clear()
@@ -187,7 +193,7 @@ class Classifier:
         if static_mode == "numbers":
             if self._model_numbers is not None:
                 result = self._run(self._model_numbers, self._labels_numbers,
-                                   h1, "numbers", _NUMBER_THRESHOLD)
+                                   h1, "numbers", _NUMBER_THRESHOLD, aspect)
             else:
                 # Numbers mode requested but no model trained yet. Be honest:
                 # produce an empty static result so the HUD can show a notice
@@ -196,7 +202,7 @@ class Classifier:
                           "model_used": None, "top3": []}
         else:
             result = self._run(self._model_one, self._labels_one,
-                               h1, "one_hand", _LETTER_THRESHOLD)
+                               h1, "one_hand", _LETTER_THRESHOLD, aspect)
 
         result["word_prediction"] = word_pred
         # True only if the word model is loaded AND the hand moves enough.
@@ -208,8 +214,8 @@ class Classifier:
     # Internals
     # ------------------------------------------------------------------
 
-    def _run(self, model, labels, flat, model_name, threshold):
-        normalized = normalize_landmarks(flat)
+    def _run(self, model, labels, flat, model_name, threshold, aspect=None):
+        normalized = normalize_landmarks(flat, aspect=aspect)
         tensor = tf.constant([normalized], dtype=tf.float32)
 
         # Calling the model directly is 3-5x faster than model.predict()

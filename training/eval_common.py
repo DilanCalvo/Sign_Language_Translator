@@ -183,13 +183,20 @@ def report(y_true, y_pred, y_conf, names, png_path=None, threshold=None):
 def load_static_csv_dir(data_dir, excluded=None):
     """Load every capture CSV in a directory as (X, y_str, groups).
 
-    X          normalized (N, 63) float32 landmarks.
+    X          normalized (N, 63) float32 landmarks, aspect-corrected (see
+               normalize_landmarks): rows with an "aspect" column use their
+               recorded per-frame value; legacy rows without one fall back to
+               config.LEGACY_CAPTURE_ASPECT. This loader is the ONLY parser of
+               the capture-CSV format — trainers wrap it so the correction can
+               never drift between training and evaluation.
     y_str      string labels (kept as strings so "0".."9" / "A".."Y" are stable).
     groups     the SOURCE FILE stem each row came from. One capture run writes
                one timestamped file, so the file is the natural "session" unit
                for leak-free grouping — no extra schema needed.
     """
     import pandas as pd
+
+    from config import LEGACY_CAPTURE_ASPECT
 
     excluded = set(excluded or [])
     paths = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
@@ -206,12 +213,18 @@ def load_static_csv_dir(data_dir, excluded=None):
         # "0.0") when the 63 landmark columns are floats. Pulling the label column
         # on its own preserves its dtype, so "0".."9" and "A".."Y" stay intact.
         labels = [str(v) for v in df["label"].tolist()]
-        raw = df.drop(columns=["label"]).to_numpy(dtype=np.float32)
+        if "aspect" in df.columns:
+            aspects = df["aspect"].to_numpy(dtype=np.float32)
+            feature_df = df.drop(columns=["label", "aspect"])
+        else:
+            aspects = np.full(len(df), LEGACY_CAPTURE_ASPECT, dtype=np.float32)
+            feature_df = df.drop(columns=["label"])
+        raw = feature_df.to_numpy(dtype=np.float32)
         n_before = len(X)
-        for label, row in zip(labels, raw):
+        for label, row, aspect in zip(labels, raw, aspects):
             if label in excluded:
                 continue
-            X.append(normalize_landmarks(row))
+            X.append(normalize_landmarks(row, aspect=float(aspect)))
             y.append(label)
             groups.append(stem)
         print(f"  + {len(X) - n_before:,} samples from {os.path.basename(p)}")

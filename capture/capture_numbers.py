@@ -149,8 +149,12 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = os.path.join(OUTPUT_DIR, f"capture_{timestamp}.csv")
 
-    # CSV columns: label + 63 raw landmark values (21 points x,y,z)
-    columns = ["label"] + [f"{c}{i}" for i in range(21) for c in ("x", "y", "z")]
+    # CSV columns: label + 63 raw landmark values (21 points x,y,z) + the frame
+    # aspect ratio (width/height). MediaPipe normalizes x by width and y by
+    # height, so the aspect is part of the data: loaders need it to un-stretch
+    # the landmarks (see normalize_landmarks). Recording it per row makes each
+    # CSV self-describing — no assumed camera geometry ever again.
+    columns = ["label"] + [f"{c}{i}" for i in range(21) for c in ("x", "y", "z")] + ["aspect"]
 
     rows = []  # all captured samples
 
@@ -165,6 +169,7 @@ def main():
     last_capture_t  = 0.0
     flash_alpha     = 0.0        # 0 to 1, for the green flash
     labels_done     = 0
+    res_printed     = False      # camera resolution announced once
 
     while label_idx < len(LABELS):
         label = LABELS[label_idx]
@@ -172,6 +177,11 @@ def main():
 
         if frame is None:
             break
+
+        if not res_printed:
+            h, w = frame.shape[:2]
+            print(f"Camera frame: {w}x{h} (aspect {w / h:.4f})")
+            res_printed = True
 
         now              = time.time()
         hand_detected    = lm_data["num_hands"] >= 1 and lm_data["landmarks_hand1"] is not None
@@ -205,7 +215,7 @@ def main():
 
         if do_capture:
             flat = lm_data["landmarks_hand1"]
-            rows.append([label] + flat)
+            rows.append([label] + flat + [lm_data["frame_aspect"]])
             count       += 1
             last_capture_t = now
             flash_alpha    = 1.0

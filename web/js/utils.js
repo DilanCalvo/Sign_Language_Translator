@@ -13,19 +13,36 @@ const MIDDLE_MCP = 9;  // base of the middle finger (scale reference)
 /**
  * Normalize one 63-value hand sample (21 landmarks x (x, y, z)).
  * Port of src/utils.py::_normalize_single:
- *   1. center the 21 points on the wrist
- *   2. scale by the wrist -> middle-MCP distance (guard: < 1e-6 -> 1.0)
+ *   1. undo MediaPipe's per-axis stretch when `aspect` (frame width/height)
+ *      is given: y /= aspect, x and z untouched ("width units" — MediaPipe
+ *      normalizes x by frame width, y by frame height, z scales like x, so
+ *      a 9:16 portrait phone otherwise yields a differently-stretched vector
+ *      than the 16:9 training data). Must happen BEFORE centering/scaling.
+ *   2. center the 21 points on the wrist
+ *   3. scale by the wrist -> middle-MCP distance (guard: < 1e-6 -> 1.0)
+ * `aspect` undefined/null skips step 1 (legacy behavior).
  */
-export function normalizeLandmarks(flat) {
+export function normalizeLandmarks(flat, aspect) {
   if (flat.length !== 63) {
     throw new Error(`Expected 63 values, got ${flat.length}`);
   }
+  let src = flat;
+  if (aspect !== undefined && aspect !== null) {
+    // Float32Array mirrors Python's float32 rounding after the division,
+    // keeping the parity fixtures within tolerance.
+    src = new Float32Array(63);
+    for (let i = 0; i < 21; i++) {
+      src[i * 3] = flat[i * 3];
+      src[i * 3 + 1] = flat[i * 3 + 1] / aspect;
+      src[i * 3 + 2] = flat[i * 3 + 2];
+    }
+  }
   const out = new Float32Array(63);
-  const wx = flat[WRIST * 3], wy = flat[WRIST * 3 + 1], wz = flat[WRIST * 3 + 2];
+  const wx = src[WRIST * 3], wy = src[WRIST * 3 + 1], wz = src[WRIST * 3 + 2];
   for (let i = 0; i < 21; i++) {
-    out[i * 3] = flat[i * 3] - wx;
-    out[i * 3 + 1] = flat[i * 3 + 1] - wy;
-    out[i * 3 + 2] = flat[i * 3 + 2] - wz;
+    out[i * 3] = src[i * 3] - wx;
+    out[i * 3 + 1] = src[i * 3 + 1] - wy;
+    out[i * 3 + 2] = src[i * 3 + 2] - wz;
   }
   let scale = Math.hypot(
     out[MIDDLE_MCP * 3], out[MIDDLE_MCP * 3 + 1], out[MIDDLE_MCP * 3 + 2],

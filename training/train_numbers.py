@@ -26,14 +26,12 @@ Strategy:
     - EarlyStopping + ReduceLROnPlateau + ModelCheckpoint.
 """
 
-import glob
 import json
 import os
 import sys
 from collections import Counter
 
 import numpy as np
-import pandas as pd
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -43,11 +41,11 @@ import tensorflow as tf
 from tensorflow.keras import callbacks, layers, models, regularizers
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.utils import normalize_landmarks
 from training.run_log import write_run_metadata
 from config import (
-    MODEL_NUMBERS_PATH  as MODEL_OUT,
-    LABELS_NUMBERS_PATH as LABELS_OUT,
+    MODEL_NUMBERS_PATH    as MODEL_OUT,
+    LABELS_NUMBERS_PATH   as LABELS_OUT,
+    LEGACY_CAPTURE_ASPECT,
 )
 
 # Directory scanned for capture CSVs. Every *.csv here is used, so adding a
@@ -70,26 +68,20 @@ _MIRROR_MASK_63 = tf.constant(
 def _load_data(data_dir) -> tuple[np.ndarray, np.ndarray, int]:
     """Load every capture CSV in `data_dir`. Returns (X, labels, n_files);
     n_files doubles as the session count for the run record (one capture run
-    writes one timestamped file)."""
-    paths = sorted(glob.glob(os.path.join(data_dir, "*.csv")))
-    if not paths:
+    writes one timestamped file).
+
+    Thin wrapper over eval_common.load_static_csv_dir — the single parser of
+    the capture-CSV format (handles the optional "aspect" column and the
+    legacy aspect-ratio correction, and keeps digit labels as strings so the
+    label map is stable "0".."9")."""
+    from training.eval_common import load_static_csv_dir
+
+    X, labels, groups = load_static_csv_dir(data_dir)
+    if len(X) == 0:
         print(f"[ERROR] No CSV found in {data_dir}/. "
               "Capture first: python capture/capture_numbers.py")
         raise SystemExit(1)
-
-    frames = []
-    for p in paths:
-        df = pd.read_csv(p)
-        frames.append(df)
-        print(f"  + {len(df):,} samples from {p}")
-
-    df = pd.concat(frames, ignore_index=True)
-    # Digit labels can read as ints from CSV; force them back to strings so the
-    # label map is stable ("0".."9").
-    labels = np.array([str(v) for v in df["label"].tolist()])
-    raw = df.drop(columns=["label"]).to_numpy(dtype=np.float32)
-    normalized = np.stack([normalize_landmarks(row) for row in raw])
-    return normalized, labels, len(paths)
+    return X, labels, len(np.unique(groups))
 
 
 def _augment(x, y):
@@ -253,6 +245,8 @@ def main():
         val_accuracy=val_acc,
         config={"epochs": EPOCHS, "batch_size": BATCH_SIZE,
                 "noise_stddev": NOISE_STDDEV, "scale_jitter": SCALE_JITTER,
+                "aspect_corrected": True,
+                "legacy_capture_aspect": round(LEGACY_CAPTURE_ASPECT, 4),
                 "l2": L2, "seed": SEED},
     )
 

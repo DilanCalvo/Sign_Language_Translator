@@ -82,8 +82,11 @@ els.clearBtn.addEventListener("click", () => {
 });
 
 // ---- Replica of src/classifier.py::_run (top-3 + acceptance threshold) ----
-function classify(flat63) {
-  const probs = model.predict(normalizeLandmarks(flat63));
+// `aspect` (frame width/height) lets normalizeLandmarks undo MediaPipe's
+// per-axis stretch — without it a portrait phone feeds the model differently
+// stretched vectors than the 16:9 data it was trained on.
+function classify(flat63, aspect) {
+  const probs = model.predict(normalizeLandmarks(flat63, aspect));
   const order = [...probs.keys()].sort((a, b) => probs[b] - probs[a]);
   const top3 = order.slice(0, 3)
     .filter((i) => probs[i] >= ALT_MIN_CONFIDENCE)
@@ -149,6 +152,16 @@ const MAX_CONSECUTIVE_ERRORS = 30; // ~1s of solid failures at 30fps
 
 function onFrame(now) {
   try {
+    // Re-sync canvas dims if the video track changed size mid-session — a
+    // phone rotating portrait<->landscape flips videoWidth/Height, and a stale
+    // canvas would both squash the detector input and feed classify() the
+    // wrong aspect ratio.
+    if (video.videoWidth && video.videoWidth !== els.canvas.width) {
+      els.canvas.width = video.videoWidth;
+      els.canvas.height = video.videoHeight;
+      els.canvas.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+    }
+
     const w = els.canvas.width, h = els.canvas.height;
 
     // Mirror BEFORE detection (parity with cv2.flip in src/detector.py).
@@ -173,7 +186,7 @@ function onFrame(now) {
         flat[i * 3 + 1] = hand[i].y;
         flat[i * 3 + 2] = hand[i].z;
       }
-      clsResult = classify(flat);
+      clsResult = classify(flat, w / h);
       smoother.update(clsResult.prediction);
       setStatus("");
     } else {

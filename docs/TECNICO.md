@@ -63,12 +63,23 @@ la cámara, porque todo eso desaparece al quedarnos solo con coordenadas. Ademá
 la entrada es muy ligera (decenas de números por frame en lugar de una imagen
 completa), lo que permite tiempo real sin GPU.
 
-**Normalización (clave).** Antes de clasificar, los landmarks se normalizan:
-se **centran en la muñeca** y se **escalan** por el tamaño de la mano
-(muñeca → nudillos). Así la representación es **invariante a la posición y al
-tamaño** de la mano en la imagen. Esta normalización (`normalize_landmarks`) es
-una **única fuente de verdad** usada idénticamente en captura, entrenamiento e
-inferencia; si difirieran, el modelo fallaría.
+**Normalización (clave).** Antes de clasificar, los landmarks se normalizan en
+tres pasos: primero se **deshace el estiramiento por-eje de MediaPipe** (x se
+normaliza por el ancho del frame e y por el alto — z escala como x —, así que
+la misma seña física produce vectores distintos en una webcam 16:9 que en un
+teléfono vertical 9:16; con el aspect ratio del frame se corrige: `y /= aspecto`,
+x y z intactos), luego se **centran en la muñeca** y se **escalan** por el
+tamaño de la mano (muñeca → nudillos). Así la representación es **invariante a
+la posición, al tamaño y a la orientación de la cámara**. Esta normalización
+(`normalize_landmarks`) es una **única fuente de verdad** usada idénticamente en
+captura, entrenamiento e inferencia; si difirieran, el modelo fallaría. Las
+capturas nuevas guardan el aspecto por fila (columna `aspect` del CSV); las
+anteriores a ese cambio usan `LEGACY_CAPTURE_ASPECT` (16:9, la webcam original).
+
+> Deuda conocida: el pipeline de **palabras** no aplica la corrección de aspecto
+> (ni en la forma de mano ni en el ancla de cuerpo), porque sus features
+> guardados (.npy) son anteriores al cambio y modelo y datos son consistentes
+> entre sí. Corregirlo requiere recapturar el vocabulario.
 
 ---
 
@@ -77,7 +88,7 @@ inferencia; si difirieran, el modelo fallaría.
 ```
 Cámara (OpenCV)
   → MediaPipe detecta la mano y extrae 21 landmarks (x, y, z) = 63 valores
-  → normalize_landmarks (centrado en muñeca + escala invariante)
+  → normalize_landmarks (corrección de aspecto + centrado en muñeca + escala invariante)
   → red neuronal clasifica la seña
   → suavizado temporal (PredictionSmoother) elimina parpadeo de un solo frame
   → predicción estable dibujada en pantalla (+ voz / subtítulos)

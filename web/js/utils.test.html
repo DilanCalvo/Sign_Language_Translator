@@ -51,11 +51,15 @@ function maxAbsDiff(a, b) {
 }
 
 // ---- 1. normalizeLandmarks vs Python (tolerance 1e-5) ----
+// Each fixture carries the aspect ratio (frame width/height) its landmarks
+// were captured at; the "invariance_*" cases stretch one physical pose as a
+// 16:9 camera and as a 9:16 portrait phone and expect the SAME output — the
+// direct regression gate for the cross-device aspect bug.
 {
   const ul = section("normalizeLandmarks — vs Python normalize_landmarks");
   const cases = await (await fetch("../fixtures/normalize_fixtures.json")).json();
   for (const c of cases) {
-    const got = normalizeLandmarks(c.input);
+    const got = normalizeLandmarks(c.input, c.aspect);
     const diff = maxAbsDiff(got, c.expected);
     report(ul, `case ${c.label}`, diff < 1e-5, `max diff ${diff.toExponential(2)}`);
   }
