@@ -76,10 +76,16 @@ captura, entrenamiento e inferencia; si difirieran, el modelo fallaría. Las
 capturas nuevas guardan el aspecto por fila (columna `aspect` del CSV); las
 anteriores a ese cambio usan `LEGACY_CAPTURE_ASPECT` (16:9, la webcam original).
 
-> Deuda conocida: el pipeline de **palabras** no aplica la corrección de aspecto
-> (ni en la forma de mano ni en el ancla de cuerpo), porque sus features
-> guardados (.npy) son anteriores al cambio y modelo y datos son consistentes
-> entre sí. Corregirlo requiere recapturar el vocabulario.
+> El pipeline de **palabras** también aplica la corrección (forma de mano Y
+> ancla de cuerpo, `build_word_features` con `aspect` obligatorio) desde
+> 2026-07-12. Los datos y el modelo anteriores a ese cambio eran features ya
+> procesados sin corrección posible; quedaron archivados en
+> `data/real_capture/words_legacy/` y `model/legacy/`, y el vocabulario se
+> recaptura con el formato nuevo: cada take guarda landmarks **crudos**
+> (`(n_frames, 131)`: dos manos + hombros + aspecto por frame, layout en
+> `src/utils.py::pack_word_raw`), y la featurización + el resampleo a
+> `WORD_SEQ_LEN` ocurren al cargar (`train_words.py`) — así ningún cambio
+> futuro de normalización o de longitud de secuencia vuelve a invalidar datos.
 
 ---
 

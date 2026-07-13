@@ -83,13 +83,28 @@ _HAND_SHAPE_LEN = 63          # 21 landmarks x (x, y, z)
 _HAND_BLOCK_LEN = 65          # shape (63) + wrist position (x, y)
 WORD_FEATURE_LEN = 130        # left block (65) + right block (65)
 
+# Raw capture-frame layout (what capture_words.py stores on disk, packed by
+# pack_word_raw / unpacked by word_features_from_raw — both HERE so the layout
+# has exactly one source of truth):
+#   left hand (63) + right hand (63) + shoulder_l (x, y) + shoulder_r (x, y)
+#   + frame aspect (1)  =  131
+# Storing RAW landmarks instead of processed features is deliberate: it lets a
+# future normalization change (like the 2026-07 aspect fix) be applied
+# retroactively at load time instead of forcing a full vocabulary recapture.
+# Missing hand / missing shoulders are stored as zeros — MediaPipe never emits
+# an exact all-zeros block, so zeros unambiguously mean "absent".
+WORD_RAW_FRAME_LEN = 131
 
-def _hand_block(hand_flat, frame):
+
+def _hand_block(hand_flat, frame, aspect):
     """
     Build one hand's 65-value block: 63 handshape + 2 body-relative wrist pos.
 
     hand_flat: list/array of 63 raw image-normalized landmarks, or None.
-    frame: (cx, cy, scale) body frame, or None when pose was not detected.
+    frame: (cx, cy, scale) body frame IN WIDTH UNITS (already un-stretched),
+           or None when pose was not detected.
+    aspect: frame width/height — un-stretches the handshape and the raw wrist y
+            so the block is camera-orientation invariant.
 
     A missing hand returns zeros — a distinct pattern the model reads as absent.
     When there is no body frame, the position part is 0 (NOT the raw screen
@@ -100,18 +115,18 @@ def _hand_block(hand_flat, frame):
     if hand_flat is None:
         return np.zeros(_HAND_BLOCK_LEN, dtype=np.float32)
     arr = np.asarray(hand_flat, dtype=np.float32)
-    shape = _normalize_single(arr)                 # 63, wrist-centered + scaled
+    shape = _normalize_single(arr, aspect)         # 63, un-stretched + wrist-centered + scaled
     if frame is None:
         pos_x = pos_y = 0.0
     else:
         cx, cy, scale = frame
         wrist = arr.reshape(21, 3)[_WRIST]         # raw wrist x, y, z
         pos_x = (wrist[0] - cx) / scale
-        pos_y = (wrist[1] - cy) / scale
+        pos_y = (wrist[1] / np.float32(aspect) - cy) / scale
     return np.concatenate([shape, [pos_x, pos_y]]).astype(np.float32)
 
 
-def build_word_features(left_hand, right_hand, shoulder_l, shoulder_r):
+def build_word_features(left_hand, right_hand, shoulder_l, shoulder_r, aspect):
     """
     Build the full (WORD_FEATURE_LEN,) word feature vector for one frame.
 
@@ -122,24 +137,85 @@ def build_word_features(left_hand, right_hand, shoulder_l, shoulder_r):
         shoulder_l, shoulder_r: (x, y) of the left/right shoulder, or None if
             pose was not detected (then there is no body anchor: the wrist
             position is 0, the handshape still works).
+        aspect: frame width/height. REQUIRED — MediaPipe normalizes x by frame
+            width and y by height, so without undoing that stretch the same
+            physical sign yields different vectors on a 16:9 webcam vs a 9:16
+            portrait phone (the bug that forced the 2026-07 vocabulary
+            recapture). Every caller has it: the detector emits it per frame
+            (landmarks_data["frame_aspect"]) and raw capture rows store it.
+            Made mandatory (not defaulted) so a forgotten call site fails
+            loudly instead of silently reintroducing the geometry bug — the
+            classifier's stale-model guard is width-based and cannot catch it.
 
     Returns:
         np.ndarray float32 of shape (WORD_FEATURE_LEN,).
     """
+    if aspect is None:
+        raise ValueError(
+            "build_word_features requires the frame aspect ratio (width/height). "
+            "Pass landmarks_data['frame_aspect'] (live) or the raw row's stored "
+            "aspect (training)."
+        )
+
+    # Body frame in WIDTH UNITS: un-stretch every y before any geometry, so the
+    # anchor (center + shoulder-width scale) is camera-orientation invariant.
+    # hypot over both axes (not |dx| alone) keeps the scale invariant to head/
+    # torso roll; after un-stretching, shoulder-y jitter enters it only at
+    # ~sin(roll) weight — second order.
     frame = None
     if shoulder_l is not None and shoulder_r is not None:
+        a = np.float32(aspect)
         cx = (shoulder_l[0] + shoulder_r[0]) * 0.5
-        cy = (shoulder_l[1] + shoulder_r[1]) * 0.5
+        cy = (shoulder_l[1] / a + shoulder_r[1] / a) * 0.5
         scale = float(np.hypot(shoulder_l[0] - shoulder_r[0],
-                               shoulder_l[1] - shoulder_r[1]))
+                               (shoulder_l[1] - shoulder_r[1]) / a))
         if scale < 1e-6:
             scale = 1.0
         frame = (cx, cy, scale)
 
     return np.concatenate([
-        _hand_block(left_hand,  frame),
-        _hand_block(right_hand, frame),
+        _hand_block(left_hand,  frame, aspect),
+        _hand_block(right_hand, frame, aspect),
     ]).astype(np.float32)
+
+
+def pack_word_raw(left_hand, right_hand, shoulder_l, shoulder_r, aspect):
+    """
+    Pack one frame's RAW capture data into a (WORD_RAW_FRAME_LEN,) float32 row
+    (the on-disk format of capture_words.py — see the layout comment above).
+    Missing hand/shoulders are stored as zeros; word_features_from_raw maps
+    them back to None.
+    """
+    row = np.zeros(WORD_RAW_FRAME_LEN, dtype=np.float32)
+    if left_hand is not None:
+        row[0:63] = np.asarray(left_hand, dtype=np.float32)
+    if right_hand is not None:
+        row[63:126] = np.asarray(right_hand, dtype=np.float32)
+    if shoulder_l is not None:
+        row[126:128] = shoulder_l
+    if shoulder_r is not None:
+        row[128:130] = shoulder_r
+    row[130] = aspect
+    return row
+
+
+def word_features_from_raw(row):
+    """
+    Turn one stored raw capture row back into the (WORD_FEATURE_LEN,) feature
+    vector — the load-time counterpart of pack_word_raw. This is where the
+    training loader applies the CURRENT normalization to old raw data, which is
+    the whole point of storing raw: feature changes never invalidate captures.
+    """
+    row = np.asarray(row, dtype=np.float32)
+    if row.size != WORD_RAW_FRAME_LEN:
+        raise ValueError(
+            f"Raw word frame must have {WORD_RAW_FRAME_LEN} values, got {row.size}."
+        )
+    left  = row[0:63]   if np.any(row[0:63])   else None
+    right = row[63:126] if np.any(row[63:126]) else None
+    sh_l  = tuple(row[126:128]) if np.any(row[126:128]) else None
+    sh_r  = tuple(row[128:130]) if np.any(row[128:130]) else None
+    return build_word_features(left, right, sh_l, sh_r, float(row[130]))
 
 
 def mirror_word_sequence(seq) -> np.ndarray:

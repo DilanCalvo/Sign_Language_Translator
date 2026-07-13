@@ -115,12 +115,14 @@ WORD_CONFIDENCE_THRESHOLD = 0.75
 # tell "hand goes up then down" from "down then up"), which collapses as the
 # vocabulary grows. Order matters in ASL, so the model must see the sequence.
 #
-# Recording length varies (a sign can take 0.5-1.5s); both capture and live
-# inference RESAMPLE whatever was recorded to exactly this many frames
-# (src.utils.resample_sequence) so every sample has the same shape (T, 63).
+# Recording length varies (a sign can take 0.5-1.5s); the training loader and
+# live inference RESAMPLE whatever was recorded to exactly this many frames
+# (src.utils.resample_sequence) so the model always sees (T, WORD_FEATURE_DIM).
+# Capture saves takes UN-resampled (raw format) — so changing this value only
+# requires retraining, never recapturing.
 #
-# CRITICAL WARNING: this value MUST be identical in capture, training and
-# inference. It is imported everywhere from here — never hardcode it.
+# CRITICAL WARNING: this value MUST be identical in training and inference.
+# It is imported everywhere from here — never hardcode it.
 #
 #   Raise → more temporal detail; better for complex/long signs, slower.
 #   Lower → faster, less detail.
@@ -366,20 +368,17 @@ CAPTURE_TARGET_PER_WORD = 34
 
 CAPTURE_PER_SESSION_PER_WORD = 7
 
-# Frames the captured sequence is resampled to before saving.
-#
-# CRITICAL WARNING: MUST equal WORD_SEQ_LEN. Capture records a variable-length
-# take, then resamples it to this fixed length so every saved sample is
-# (WORD_SEQ_LEN, 63) — exactly what training and inference expect. Points to
-# the same value as WORD_SEQ_LEN so they can never drift apart.
-
-CAPTURE_SEQ_LEN = WORD_SEQ_LEN
-
 # Directory where word-capture sequences (.npy) and the manifest are saved.
 #
-# Each take is one (WORD_SEQ_LEN, 63) array at seq/<gloss>_<n>.npy; manifest.csv
-# records sample_id, gloss and train/val split. This is the .npy sequence format
-# the TCN reads (the old flat-CSV mean+std format was removed with the old model).
+# Each take is one RAW (n_frames, WORD_RAW_FRAME_LEN) array at
+# seq/<gloss>_<n>.npy (variable length, un-resampled): per frame, both hands'
+# raw landmarks + both shoulders + the camera aspect ratio (layout defined by
+# src.utils.pack_word_raw). Feature building and resampling to WORD_SEQ_LEN
+# happen at LOAD time in training/train_words.py — storing raw means a future
+# normalization or SEQ_LEN change never requires recapturing the vocabulary
+# (the 2026-07 aspect-ratio fix forced exactly that under the old processed
+# format; the pre-fix takes live in data/real_capture/words_legacy/).
+# manifest.csv records sample_id, gloss, subset and session_id.
 
 CAPTURE_OUTPUT_DIR = "data/real_capture/words"
 

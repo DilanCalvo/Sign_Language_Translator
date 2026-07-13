@@ -157,6 +157,14 @@ capture. Letter captures save timestamped CSVs; word captures save one `.npy`
 sequence per take plus a `manifest.csv` under
 `data/real_capture/words/`.
 
+All capture formats are **self-describing about camera geometry**: every
+sample records the frame's aspect ratio (CSV `aspect` column for
+letters/numbers; per-frame value in the word `.npy`). MediaPipe normalizes
+landmarks per-axis, so this is what lets models trained on a 16:9 webcam work
+on a portrait phone — and it means you can capture from any camera. Word
+takes additionally store RAW landmarks (feature building happens at training
+time), so future normalization changes never invalidate captured data.
+
 **Capture across multiple sessions.** For words especially, re-run the capture
 script on different days (different lighting, clothing, distance). The script
 *appends*, so this builds a multi-session dataset. A model trained on many takes

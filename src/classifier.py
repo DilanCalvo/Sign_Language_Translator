@@ -247,11 +247,15 @@ class Classifier:
         if self._model_words is None:
             return None
         # Body-anchored, two-hand feature (slots by handedness). Hands are taken
-        # from the handedness slots; the body frame from the shoulders.
+        # from the handedness slots; the body frame from the shoulders. The
+        # frame aspect is REQUIRED by build_word_features (it un-stretches
+        # MediaPipe's per-axis coords so features match training regardless of
+        # camera orientation).
         by_side = landmarks_data["hands_by_side"]
         feat = build_word_features(
             by_side["Left"], by_side["Right"],
             landmarks_data["shoulder_l"], landmarks_data["shoulder_r"],
+            landmarks_data["frame_aspect"],
         )
         self._word_buffer.append(feat)
         if len(self._word_buffer) < _MIN_FRAMES:

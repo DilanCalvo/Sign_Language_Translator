@@ -159,7 +159,8 @@ def _draw_translation(frame, text, status):
 
 def _draw_hud(frame, stable, raw_result, stable_word=None, stable_word_conf=0.0,
               hand_is_signing=False, mode="letters", num_hands=0,
-              speech_enabled=False, numbers_unavailable=False):
+              speech_enabled=False, numbers_unavailable=False,
+              words_unavailable=False):
     h, w = frame.shape[:2]
 
     top3       = raw_result["top3"]
@@ -169,16 +170,23 @@ def _draw_hud(frame, stable, raw_result, stable_word=None, stable_word_conf=0.0,
     show_static = not hand_is_signing and not numbers_unavailable
 
     # -----------------------------------------------------------------------
-    # Numbers mode selected but no trained model: be honest about it.
+    # Mode selected but its model is missing: be honest about it instead of
+    # showing a blank screen (letters are suppressed in words mode, so without
+    # this notice a missing word model would look like a frozen app).
     # -----------------------------------------------------------------------
+    unavailable_msg = None
     if numbers_unavailable:
-        msg  = "Numbers model not trained yet"
-        hint = "capture 0-9 and train model/model_numbers.h5"
-        (mw, _), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
-        cv2.putText(frame, msg, ((w - mw) // 2, h // 2 - 8),
+        unavailable_msg  = "Numbers model not trained yet"
+        unavailable_hint = "capture 0-9 and train model/model_numbers.h5"
+    elif words_unavailable:
+        unavailable_msg  = "Word model not trained yet"
+        unavailable_hint = "recapture: python capture/capture_words.py, then train_words.py"
+    if unavailable_msg:
+        (mw, _), _ = cv2.getTextSize(unavailable_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+        cv2.putText(frame, unavailable_msg, ((w - mw) // 2, h // 2 - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, _YELLOW, 2, cv2.LINE_AA)
-        (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.putText(frame, hint, ((w - hw) // 2, h // 2 + 22),
+        (hw, _), _ = cv2.getTextSize(unavailable_hint, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.putText(frame, unavailable_hint, ((w - hw) // 2, h // 2 + 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, _GRAY, 1, cv2.LINE_AA)
 
     # -----------------------------------------------------------------------
@@ -335,6 +343,9 @@ def main():
 
         # Numbers mode with no trained model: show a notice, skip prediction.
         numbers_unavailable = (mode == "numbers" and not classifier.has_numbers)
+        # Same honesty for words mode: without a trained word model the screen
+        # would otherwise just stay blank (letters are suppressed in this mode).
+        words_unavailable = (mode == "words" and not classifier.has_words)
 
         # ----- Static signs (active in "letters" and "numbers" modes) -----
         if mode in ("letters", "numbers"):
@@ -397,6 +408,7 @@ def main():
             landmarks_data["num_hands"],
             speech_enabled=(speech_input is not None),
             numbers_unavailable=numbers_unavailable,
+            words_unavailable=words_unavailable,
         )
         if mode in ("letters", "numbers"):
             letter_buffer.draw_subtitle(frame)

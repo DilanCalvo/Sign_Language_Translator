@@ -43,7 +43,12 @@ from config import (
     MODEL_WORDS_PATH   as MODEL_OUT,
     LABELS_WORDS_PATH  as LABELS_OUT,
 )
-from src.utils import mirror_word_sequence, resample_sequence
+from src.utils import (
+    WORD_RAW_FRAME_LEN,
+    mirror_word_sequence,
+    resample_sequence,
+    word_features_from_raw,
+)
 from training.run_log import write_run_metadata
 
 HERE     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -69,24 +74,45 @@ def load_manifest():
 def load_samples(rows, label_to_idx):
     """Load (X, y, groups) for ALL takes in the manifest.
 
+    Takes are stored RAW — (n_frames, WORD_RAW_FRAME_LEN), variable length,
+    written by capture_words.py — and turned into model-ready features HERE:
+    resample the raw take to WORD_SEQ_LEN (index-picking, so it commutes with
+    per-frame featurization), then word_features_from_raw per frame. Building
+    features at load time is the point of the raw format: a normalization
+    change re-applies to every stored take with no recapture.
+
     groups holds each take's session_id (the capture run it came from). It is
     what makes validation honest: whole sessions are held out instead of random
     takes, so the model is never validated against the same day/lighting it
-    trained on. Takes written before session_id existed are tagged "legacy".
+    trained on.
     """
     X, y, groups = [], [], []
+    missing = 0
     for r in rows:
         path = os.path.join(SEQ_DIR, f"{r['sample_id']}.npy")
         if not os.path.isfile(path):
+            missing += 1
             continue
         seq = np.load(path)
-        if seq.shape != (T, FEATURE_DIM):
+        if seq.ndim == 2 and seq.shape[1] == FEATURE_DIM:
+            raise SystemExit(
+                f"[ERROR] {r['sample_id']}.npy is width-{FEATURE_DIM} LEGACY "
+                "processed data (pre aspect-correction). It cannot be "
+                "retro-corrected and must not be trained on — move it to "
+                "data/real_capture/words_legacy/ and recapture with "
+                "capture/capture_words.py."
+            )
+        if seq.ndim != 2 or seq.shape[1] != WORD_RAW_FRAME_LEN or len(seq) < 2:
             print(f"  [WARN] {r['sample_id']} has shape {seq.shape}, expected "
-                  f"{(T, FEATURE_DIM)} — skipped (re-capture after changing WORD_SEQ_LEN).")
+                  f"(n_frames, {WORD_RAW_FRAME_LEN}) raw — skipped.")
             continue
-        X.append(seq)
+        raw32 = resample_sequence(seq, T)
+        X.append(np.stack([word_features_from_raw(f) for f in raw32]))
         y.append(label_to_idx[r["gloss"]])
         groups.append(r.get("session_id") or "legacy")
+    if missing:
+        print(f"  [WARN] {missing} manifest row(s) have no .npy file on disk — "
+              "skipped. If unexpected, run tools/rebuild_manifest.py.")
     if not X:
         return (np.empty((0, T, FEATURE_DIM), np.float32),
                 np.empty((0,), np.int64), np.empty((0,), object))

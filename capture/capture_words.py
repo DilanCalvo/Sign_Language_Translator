@@ -7,13 +7,17 @@ single mean+std vector), this saves the full ORDERED sequence: the temporal
 word model (TCN) reads the movement over time, which is what lets it tell
 similar signs apart as the vocabulary grows.
 
-Each take is recorded at a variable length, then resampled to WORD_SEQ_LEN
-frames (src.utils.resample_sequence) and saved as one (WORD_SEQ_LEN, 63) array.
-This is the EXACT same preprocessing inference uses, so what you capture matches
-what the model sees live.
+Each take is saved as RAW landmarks — (n_frames, WORD_RAW_FRAME_LEN) with
+n_frames variable (whatever was recorded): per frame, both hands' raw
+landmarks + both shoulders + the camera aspect ratio, packed by
+src.utils.pack_word_raw. Feature building (normalization, body anchor) and
+temporal resampling happen at LOAD time in the trainer, not here. Deliberate:
+storing raw means a future normalization change is applied retroactively at
+load time instead of forcing a full vocabulary recapture (the 2026-07 aspect
+fix forced exactly that, because the old format stored processed features).
 
 Output (same layout the trainer reads):
-    data/real_capture/words/seq/<gloss>_<n>.npy   # (WORD_SEQ_LEN, 63)
+    data/real_capture/words/seq/<gloss>_<n>.npy   # (n_frames, WORD_RAW_FRAME_LEN) raw
     data/real_capture/words/manifest.csv          # sample_id, gloss, subset, session_id
 
 Re-runs APPEND (counts continue), so capturing across several days builds a
@@ -42,14 +46,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     CAPTURE_TARGET_PER_WORD      as _CFG_TARGET,
     CAPTURE_PER_SESSION_PER_WORD as _CFG_SESSION_TARGET,
-    CAPTURE_SEQ_LEN              as _SEQ_LEN,
     CAPTURE_OUTPUT_DIR          as _OUTPUT_DIR,
     WORD_BUFFER_FRAMES          as _MAX_REC,
     WORD_MIN_FRAMES             as _MIN_REC,
     WORD_NULL_LABEL             as _NEGATIVE_LABEL,
 )
 from src.detector import Detector
-from src.utils import resample_sequence, build_word_features
+from src.utils import pack_word_raw
 
 # -------------------------------------------------------------------
 # Vocabulary to capture. ASL GLOSSES in English (citation form) — the LLM
@@ -129,12 +132,17 @@ def _session_count() -> int:
 
 
 def _save_take(word, buf, counts, session_counts, new_rows, session_id):
-    """Resample the recorded take to WORD_SEQ_LEN and persist it."""
+    """Persist the recorded take as RAW frames, un-resampled.
+
+    Resampling to WORD_SEQ_LEN moved to load time (the trainer) on purpose:
+    keeping the full recorded length means a future WORD_SEQ_LEN change does
+    not invalidate the capture either.
+    """
     if len(buf) < _MIN_REC:
         print(f"  [{word}] take too short ({len(buf)} frames), discarded")
         return False
     n = counts.get(word, 0)                         # cumulative -> unique filename
-    seq = resample_sequence(buf, _SEQ_LEN)        # (WORD_SEQ_LEN, 63)
+    seq = np.stack(buf).astype(np.float32)          # (n_frames, WORD_RAW_FRAME_LEN)
     sample_id = f"{word}_{n:03d}"
     np.save(os.path.join(SEQ_DIR, f"{sample_id}.npy"), seq)
     # Spread val takes across the run; never make take 0 a val sample.
@@ -221,6 +229,7 @@ def main():
     recording = False
     buf = deque(maxlen=_MAX_REC)
     flash = 0.0
+    res_printed = False      # camera resolution announced once
 
     while w_idx < len(WORDS):
         word = WORDS[w_idx]
@@ -237,16 +246,22 @@ def main():
         frame, lm = detector.get_frame()
         if frame is None:
             break
+        if not res_printed:
+            h, w = frame.shape[:2]
+            print(f"Camera frame: {w}x{h} (aspect {w / h:.4f})")
+            res_printed = True
         flash = max(0.0, flash - 0.06)
         by_side = lm["hands_by_side"]
         hand_ok = by_side["Left"] is not None or by_side["Right"] is not None
         pose_ok = lm["shoulder_l"] is not None and lm["shoulder_r"] is not None
 
         if recording and hand_ok:
-            # Body-anchored two-hand feature — identical to what inference uses.
-            buf.append(build_word_features(
+            # RAW frame record (hands + shoulders + aspect) — featurization
+            # happens at load/inference time so it can always be re-done.
+            buf.append(pack_word_raw(
                 by_side["Left"], by_side["Right"],
-                lm["shoulder_l"], lm["shoulder_r"]))
+                lm["shoulder_l"], lm["shoulder_r"],
+                lm["frame_aspect"]))
             if len(buf) >= _MAX_REC:
                 recording = False
                 if _save_take(word, list(buf), counts, session_counts, new_rows, session_id):
