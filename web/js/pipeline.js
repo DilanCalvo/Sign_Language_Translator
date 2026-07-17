@@ -122,6 +122,16 @@ let drawer = null;
 let video = null;
 let lastFrameTimes = [];
 
+// ---- Perf instrumentation (opt-in via ?debug) ----
+// Confirms which MediaPipe delegate actually loaded (GPU vs a silent CPU
+// fallback) plus the real camera resolution and fps — the data needed to steer
+// mobile performance work. Off unless the URL has ?debug, so normal use is
+// untouched.
+const DEBUG = new URLSearchParams(location.search).has("debug");
+let handDelegate = "?";     // "GPU" | "CPU"
+let poseDelegate = "none";  // "GPU" | "CPU" | "failed" | "none"
+let debugEl = null;
+
 function resetWordState() {
   wordFrames = [];
   wordFsm.reset();
@@ -322,6 +332,28 @@ function updateFps(now) {
   }
 }
 
+// Opt-in perf readout (?debug): shows the confirmed delegate for hand + pose,
+// the real camera resolution, mode and fps — read directly on the phone, no
+// remote debugging needed.
+function updateDebug() {
+  if (!debugEl) {
+    debugEl = document.createElement("div");
+    debugEl.id = "perf-debug";
+    debugEl.style.cssText =
+      "position:absolute;left:8px;bottom:8px;z-index:5;white-space:pre;"
+      + "font:11px/1.4 ui-monospace,Consolas,monospace;color:#9f9;"
+      + "background:rgba(0,0,0,.62);padding:5px 8px;border-radius:6px;";
+    els.canvas.parentElement.appendChild(debugEl);
+  }
+  const res = video ? `${video.videoWidth}x${video.videoHeight}` : "?";
+  debugEl.textContent =
+    `mode: ${activeMode.id}\n` +
+    `hand: ${handDelegate}\n` +
+    `pose: ${poseDelegate}\n` +
+    `cam:  ${res}\n` +
+    `fps:  ${els.fps.textContent || "?"}`;
+}
+
 // ---- Per-frame ----
 // A crash inside the frame callback would otherwise end the
 // requestVideoFrameCallback chain and freeze the app SILENTLY — the worst
@@ -358,6 +390,7 @@ function onFrame(now) {
       processStaticFrame(result, w, h);
     }
     updateFps(now);
+    if (DEBUG) updateDebug();
     consecutiveErrors = 0;
     framesSeen++;
   } catch (err) {
@@ -531,11 +564,14 @@ async function ensurePose() {
   };
   try {
     poseLandmarker = await PoseLandmarker.createFromOptions(vision, options);
+    poseDelegate = "GPU";
   } catch {
     try {
       options.baseOptions.delegate = "CPU"; // no usable GPU delegate -> CPU
       poseLandmarker = await PoseLandmarker.createFromOptions(vision, options);
+      poseDelegate = "CPU";
     } catch (err) {
+      poseDelegate = "failed";
       console.warn("Pose detector unavailable; word signs will lose the body "
                    + "anchor (handshape only).", err);
     }
@@ -610,10 +646,12 @@ async function main() {
     };
     try {
       landmarker = await HandLandmarker.createFromOptions(vision, options);
+      handDelegate = "GPU";
     } catch {
       // Some devices have no usable GPU delegate — retry on CPU instead of dying.
       options.baseOptions.delegate = "CPU";
       landmarker = await HandLandmarker.createFromOptions(vision, options);
+      handDelegate = "CPU";
     }
     drawer = new DrawingUtils(ctx);
 
