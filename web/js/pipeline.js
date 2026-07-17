@@ -86,8 +86,19 @@ const els = {
   modeBtns: document.querySelectorAll("#mode-toggle button"),
   heading: document.getElementById("heading"),
   footer: document.getElementById("footer"),
+  cam: document.getElementById("cam"),
 };
+// `ctx` is the VISIBLE overlay canvas — it now draws ONLY the landmarks; the
+// camera itself is shown by the native <video> (#cam), which the browser
+// composites smoothly even while detectForVideo blocks the main thread.
 const ctx = els.canvas.getContext("2d");
+// Off-screen, mirrored copy of the frame fed to the detectors. Kept off-DOM so
+// the mirror-before-detect parity is preserved without drawing the video on the
+// visible canvas (which would couple video smoothness to detection speed).
+const detectCanvas = document.createElement("canvas");
+// GPU-backed (no willReadFrequently): MediaPipe uploads it to a WebGL texture,
+// so a CPU-backed canvas would only add a copy.
+const detectCtx = detectCanvas.getContext("2d");
 
 function setStatus(text, isError = false) {
   els.status.textContent = text;
@@ -109,6 +120,13 @@ const wordSmoother = new PredictionSmoother(WORD_SMOOTH_WINDOW, WORD_SMOOTH_MIN_
 const wordFsm = new WordCommitFSM(wordSmoother, WORD_COOLDOWN_SECONDS);
 const wordBuffer = new WordBuffer(WORD_SENTENCE_PAUSE_FRAMES);
 let wordFrames = [];     // Float32Array(130) per frame, capped at WORD_BUFFER_FRAMES
+
+// Pose is the heaviest per-frame cost in word mode, but the shoulders barely
+// move, so we only run it every POSE_EVERY_N detection frames and reuse the last
+// shoulders in between — big compute/heat saving with negligible anchor error.
+const POSE_EVERY_N = 3;
+let poseFrameCounter = 0;
+let lastShoulderL = null, lastShoulderR = null;
 
 let activeMode = MODES[DEFAULT_MODE];
 const modelCache = {};   // mode id -> DenseModel | TCNModel
@@ -136,6 +154,9 @@ function resetWordState() {
   wordFrames = [];
   wordFsm.reset();
   wordBuffer.clear();
+  poseFrameCounter = 0;
+  lastShoulderL = null;
+  lastShoulderR = null;
 }
 
 els.clearBtn.addEventListener("click", () => {
@@ -205,18 +226,25 @@ function processStaticFrame(result, w, h) {
 function processWordFrame(result, now, w, h) {
   const aspect = w / h;
 
-  // Shoulders from pose (body anchor). Missing pose -> no anchor (position 0),
-  // the same graceful degradation the desktop does when pose is unavailable.
-  let shoulderL = null, shoulderR = null;
-  if (poseLandmarker) {
-    const pose = poseLandmarker.detectForVideo(els.canvas, now);
+  // Shoulders from pose (body anchor), throttled to every POSE_EVERY_N frames
+  // and reusing the last result in between (shoulders barely move). Runs on the
+  // off-screen mirrored detection canvas, like the hand detector. Missing pose
+  // -> no anchor (position 0), the same graceful degradation as the desktop.
+  let shoulderL = lastShoulderL, shoulderR = lastShoulderR;
+  if (poseLandmarker && poseFrameCounter % POSE_EVERY_N === 0) {
+    const pose = poseLandmarker.detectForVideo(detectCanvas, now);
     const lm = pose.landmarks && pose.landmarks[0];
     if (lm) {
       shoulderL = [lm[POSE_LEFT_SHOULDER].x, lm[POSE_LEFT_SHOULDER].y];
       shoulderR = [lm[POSE_RIGHT_SHOULDER].x, lm[POSE_RIGHT_SHOULDER].y];
-      drawShoulders(shoulderL, shoulderR, w, h);
+    } else {
+      shoulderL = shoulderR = null; // pose lost this frame -> drop the anchor
     }
+    lastShoulderL = shoulderL;
+    lastShoulderR = shoulderR;
   }
+  poseFrameCounter++;
+  if (shoulderL && shoulderR) drawShoulders(shoulderL, shoulderR, w, h);
 
   // Hands by handedness so the same sign always lands in the same slot
   // (parity with src/detector.py hands_by_side).
@@ -366,24 +394,29 @@ const MAX_CONSECUTIVE_ERRORS = 30; // ~1s of solid failures at 30fps
 function onFrame(now) {
   try {
     // Re-sync canvas dims if the video track changed size mid-session — a
-    // phone rotating portrait<->landscape flips videoWidth/Height, and a stale
-    // canvas would both squash the detector input and feed classify() the
-    // wrong aspect ratio.
-    if (video.videoWidth && video.videoWidth !== els.canvas.width) {
-      els.canvas.width = video.videoWidth;
-      els.canvas.height = video.videoHeight;
-      els.canvas.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+    // phone rotating portrait<->landscape flips videoWidth/Height. The native
+    // <video> resizes itself; here we only keep the internal resolutions of the
+    // off-screen detection canvas and the overlay in step with it.
+    if (video.videoWidth && video.videoWidth !== detectCanvas.width) {
+      detectCanvas.width = els.canvas.width = video.videoWidth;
+      detectCanvas.height = els.canvas.height = video.videoHeight;
+      video.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
     }
 
-    const w = els.canvas.width, h = els.canvas.height;
+    const w = detectCanvas.width, h = detectCanvas.height;
 
-    // Mirror BEFORE detection (parity with cv2.flip in src/detector.py).
-    ctx.save();
-    ctx.scale(-1, 1);
-    ctx.drawImage(video, -w, 0, w, h);
-    ctx.restore();
+    // Mirror BEFORE detection (parity with cv2.flip in src/detector.py), onto
+    // the OFF-SCREEN canvas. The visible <video> is mirrored by CSS, so what is
+    // shown and what is detected match.
+    detectCtx.save();
+    detectCtx.scale(-1, 1);
+    detectCtx.drawImage(video, -w, 0, w, h);
+    detectCtx.restore();
 
-    const result = landmarker.detectForVideo(els.canvas, now);
+    // The overlay canvas only carries the landmarks; clear last frame's.
+    ctx.clearRect(0, 0, w, h);
+
+    const result = landmarker.detectForVideo(detectCanvas, now);
     if (activeMode.kind === "sequence") {
       processWordFrame(result, now, w, h);
     } else {
@@ -467,11 +500,12 @@ async function startCamera(deviceId) {
   video.srcObject = stream;
   await video.play();
 
-  els.canvas.width = video.videoWidth;
-  els.canvas.height = video.videoHeight;
-  // The CSS 16:9 aspect is only a pre-camera placeholder; cameras differ
-  // (and may differ between each other) — never stretch the image.
-  els.canvas.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+  // Size the off-screen detection canvas and the overlay to the camera. The
+  // native <video> takes the real aspect ratio (CSS placeholder 16:9 is only
+  // pre-camera), so its displayed box matches the absolutely-positioned overlay.
+  detectCanvas.width = els.canvas.width = video.videoWidth;
+  detectCanvas.height = els.canvas.height = video.videoHeight;
+  video.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
 }
 
 function currentCameraId() {
@@ -656,7 +690,7 @@ async function main() {
     drawer = new DrawingUtils(ctx);
 
     setStatus("requesting camera…");
-    video = document.createElement("video");
+    video = els.cam;          // the native <video> shown (and CSS-mirrored) in #stage
     video.playsInline = true; // iOS: play inline instead of fullscreen
     video.muted = true;
 
