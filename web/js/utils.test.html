@@ -21,8 +21,23 @@
 <div id="summary">running…</div>
 
 <script type="module">
-import { normalizeLandmarks, PredictionSmoother, LetterBuffer } from "./utils.js";
-import { loadLettersModel } from "./model.js";
+import { normalizeLandmarks, PredictionSmoother, CharBuffer,
+         wordFeaturesFromRaw, resampleSequence } from "./utils.js";
+import { loadDenseModel, loadWordModel } from "./model.js";
+import { WORD_SEQ_LEN } from "./config.js";
+
+// Both static modes run through the same JS engine; the gate covers both ports
+// so a numbers-only (or letters-only) regression can't slip through.
+const MODE_FIXTURES = [
+  { name: "letters",
+    model:   "../model/letters/model_weights.json",
+    norm:    "../fixtures/normalize_fixtures.json",
+    modelFx: "../fixtures/model_fixtures.json" },
+  { name: "numbers",
+    model:   "../model/numbers/model_weights.json",
+    norm:    "../fixtures/numbers/normalize_fixtures.json",
+    modelFx: "../fixtures/numbers/model_fixtures.json" },
+];
 
 const results = document.getElementById("results");
 let nPass = 0, nFail = 0;
@@ -55,9 +70,9 @@ function maxAbsDiff(a, b) {
 // were captured at; the "invariance_*" cases stretch one physical pose as a
 // 16:9 camera and as a 9:16 portrait phone and expect the SAME output — the
 // direct regression gate for the cross-device aspect bug.
-{
-  const ul = section("normalizeLandmarks — vs Python normalize_landmarks");
-  const cases = await (await fetch("../fixtures/normalize_fixtures.json")).json();
+for (const m of MODE_FIXTURES) {
+  const ul = section(`normalizeLandmarks [${m.name}] — vs Python normalize_landmarks`);
+  const cases = await (await fetch(m.norm)).json();
   for (const c of cases) {
     const got = normalizeLandmarks(c.input, c.aspect);
     const diff = maxAbsDiff(got, c.expected);
@@ -66,11 +81,11 @@ function maxAbsDiff(a, b) {
 }
 
 // ---- 2. Model forward pass vs Python .h5 (tolerance 1e-4 on softmax) ----
-{
-  const ul = section("LettersModel — vs Python model_one_hand.h5 softmax");
+for (const m of MODE_FIXTURES) {
+  const ul = section(`DenseModel [${m.name}] — vs Python .h5 softmax`);
   try {
-    const model = await loadLettersModel("../model/letters/model_weights.json");
-    const cases = await (await fetch("../fixtures/model_fixtures.json")).json();
+    const model = await loadDenseModel(m.model);
+    const cases = await (await fetch(m.modelFx)).json();
     for (const c of cases) {
       const probs = model.predict(Float32Array.from(c.input));
       const diff = maxAbsDiff(probs, c.expected_probs);
@@ -80,7 +95,58 @@ function maxAbsDiff(a, b) {
              `max prob diff ${diff.toExponential(2)}, argmax ${argmax}${argmax === expArgmax ? "" : " != " + expArgmax}`);
     }
   } catch (e) {
-    report(ul, "load model_weights.json", false, e.message);
+    report(ul, `load ${m.name} model_weights.json`, false, e.message);
+  }
+}
+
+// ---- 2b. Word feature building vs Python (tolerance 1e-5) ----
+// Raw capture frame (131) -> body-anchored feature (130). Includes the word
+// aspect-invariance cases (same physical frame at 16:9 and 9:16 -> same vector).
+{
+  const ul = section("buildWordFeatures [words] — raw 131 -> feature 130 vs Python");
+  const cases = await (await fetch("../fixtures/words/feature_fixtures.json")).json();
+  for (const c of cases) {
+    const got = wordFeaturesFromRaw(Float32Array.from(c.input));
+    const diff = maxAbsDiff(got, c.expected);
+    report(ul, `case ${c.label}`, diff < 1e-5, `max diff ${diff.toExponential(2)}`);
+  }
+}
+
+// ---- 2c. Word resample index picking vs numpy (must be exact) ----
+{
+  const ul = section("resampleSequence [words] — index picking vs numpy.round");
+  const cases = await (await fetch("../fixtures/words/resample_fixtures.json")).json();
+  for (const c of cases) {
+    // frames[i] = i, so the resampled values ARE the picked indices.
+    const dummy = Array.from({ length: c.n }, (_, i) => i);
+    const got = resampleSequence(dummy, c.indices.length);
+    const ok = got.length === c.indices.length && got.every((v, i) => v === c.indices[i]);
+    report(ul, `n=${c.n}`, ok, ok ? "" : `got [${got.slice(0, 6)}…]`);
+  }
+}
+
+// ---- 2d. Word TCN full chain vs Python model_words.h5 (tolerance 1e-4) ----
+// The strongest gate: it runs the SAME chain the live app does (raw take ->
+// resample -> per-frame featurize -> TCN) and must match the .h5 softmax. A
+// wrong causal/dilated conv shows up here.
+{
+  const ul = section("TCNModel [words] — resample→featurize→TCN vs Python softmax");
+  try {
+    const model = await loadWordModel("../model/words/model_weights.json");
+    const cases = await (await fetch("../fixtures/words/model_fixtures.json")).json();
+    for (const c of cases) {
+      const take = c.raw_take.map((r) => Float32Array.from(r));
+      const raw32 = resampleSequence(take, WORD_SEQ_LEN);
+      const seq = raw32.map((row) => wordFeaturesFromRaw(row));
+      const probs = model.predict(seq);
+      const diff = maxAbsDiff(probs, c.expected_probs);
+      const argmax = probs.indexOf(Math.max(...probs));
+      const expArgmax = c.expected_probs.indexOf(Math.max(...c.expected_probs));
+      report(ul, `case ${c.label}`, diff < 1e-4 && argmax === expArgmax,
+             `max prob diff ${diff.toExponential(2)}, argmax ${argmax}${argmax === expArgmax ? "" : " != " + expArgmax}`);
+    }
+  } catch (e) {
+    report(ul, "load words model", false, e.message);
   }
 }
 
@@ -106,10 +172,10 @@ function maxAbsDiff(a, b) {
   report(ul, "reset clears buffer", s.getStable() === null);
 }
 
-// ---- 4. LetterBuffer behavior (mirrors src/overlay.py) ----
+// ---- 4. CharBuffer behavior (mirrors src/overlay.py::LetterBuffer) ----
 {
-  const ul = section("LetterBuffer — behavioral");
-  const b = new LetterBuffer(3);
+  const ul = section("CharBuffer — behavioral");
+  const b = new CharBuffer(3);
   const accepted1 = b.update("a");
   const accepted2 = b.update("B"); // still cooling down
   report(ul, "first letter accepted, uppercased", accepted1 && b.getText() === "A");

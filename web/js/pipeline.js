@@ -1,11 +1,14 @@
 /**
  * Live pipeline: camera -> mirrored canvas -> MediaPipe hands -> normalize ->
- * letters model -> smoother -> UI. Mirrors main.py's letters flow:
+ * static-pose model -> smoother -> UI. Handles the two static modes (letters
+ * and numbers) behind a toggle: they share this whole pipeline and differ only
+ * in the active model, labels, and acceptance threshold (see modes.js), exactly
+ * like the desktop app's L / N modes. Mirrors main.py's static-sign flow:
  *
  *   raw = classify(frame)          (committed prediction: null below threshold)
  *   smoother.update(raw.prediction)
  *   stable = smoother.getStable()
- *   letterBuffer.update(stable)
+ *   charBuffer.update(stable)
  *
  * CRITICAL PARITY DETAIL: the desktop app flips the frame BEFORE MediaPipe
  * (src/detector.py: cv2.flip(frame, 1)), so the whole dataset was captured on
@@ -19,31 +22,54 @@
  */
 
 import {
-  LETTER_CONFIDENCE_THRESHOLD,
   LOW_CONFIDENCE_THRESHOLD,
   ALT_MIN_CONFIDENCE,
   LETTER_SMOOTH_WINDOW,
   LETTER_SMOOTH_MIN_VOTES,
   LETTER_COOLDOWN_FRAMES,
+  WORD_SEQ_LEN,
+  WORD_BUFFER_FRAMES,
+  WORD_MIN_FRAMES,
+  WORD_MOTION_WINDOW,
+  WORD_MIN_MOTION_STD,
+  WORD_SMOOTH_WINDOW,
+  WORD_SMOOTH_MIN_VOTES,
+  WORD_COOLDOWN_SECONDS,
+  WORD_SENTENCE_PAUSE_FRAMES,
+  WORD_NULL_LABEL,
   DETECTOR_MIN_DETECTION_CONFIDENCE,
   DETECTOR_MIN_PRESENCE_CONFIDENCE,
   DETECTOR_MIN_TRACKING_CONFIDENCE,
   NUM_HANDS,
-  MODEL_URL,
-  LABELS_URL,
   HAND_TASK_URL,
+  POSE_TASK_URL,
   MEDIAPIPE_WASM_URL,
 } from "./config.js";
-import { normalizeLandmarks, PredictionSmoother, LetterBuffer } from "./utils.js";
-import { loadLettersModel } from "./model.js";
+import { MODES, DEFAULT_MODE } from "./modes.js";
+import {
+  normalizeLandmarks,
+  PredictionSmoother,
+  CharBuffer,
+  buildWordFeatures,
+  resampleSequence,
+  sequenceMotion,
+  WordCommitFSM,
+  WordBuffer,
+} from "./utils.js";
+import { loadDenseModel, loadWordModel } from "./model.js";
 // Vendored copy of @mediapipe/tasks-vision@0.10.14 (see web/vendor/): the app
 // must not depend on a CDN being reachable at demo time, and the runtime
-// version stays pinned to the one the .task file was validated with.
+// version stays pinned to the one the .task files were validated with.
 import {
   FilesetResolver,
   HandLandmarker,
+  PoseLandmarker,
   DrawingUtils,
 } from "../vendor/mediapipe/vision_bundle.mjs";
+
+// MediaPipe pose landmark indices we anchor the hands to (src/detector.py).
+const POSE_LEFT_SHOULDER = 11;
+const POSE_RIGHT_SHOULDER = 12;
 
 // ---- DOM ----
 const els = {
@@ -57,6 +83,9 @@ const els = {
   clearBtn: document.getElementById("clear"),
   fps: document.getElementById("fps"),
   cameraSel: document.getElementById("camera-select"),
+  modeBtns: document.querySelectorAll("#mode-toggle button"),
+  heading: document.getElementById("heading"),
+  footer: document.getElementById("footer"),
 };
 const ctx = els.canvas.getContext("2d");
 
@@ -67,17 +96,41 @@ function setStatus(text, isError = false) {
 }
 
 // ---- State ----
+// The static smoother/buffer serve letters + numbers (they hold no model-
+// specific state) — the same sharing the desktop app does. `activeMode` selects
+// the model/labels/threshold/kind; models are lazy-loaded and cached by id.
 const smoother = new PredictionSmoother(LETTER_SMOOTH_WINDOW, LETTER_SMOOTH_MIN_VOTES);
-const letterBuffer = new LetterBuffer(LETTER_COOLDOWN_FRAMES);
-let model = null;
-let labels = null;   // {0: "A", ...}
+const charBuffer = new CharBuffer(LETTER_COOLDOWN_FRAMES);
+
+// Word (sequence) mode state: a rolling buffer of body-anchored feature frames,
+// a vote/confirm/lock-out state machine, and the running sentence. Only touched
+// when the active mode's kind is "sequence".
+const wordSmoother = new PredictionSmoother(WORD_SMOOTH_WINDOW, WORD_SMOOTH_MIN_VOTES);
+const wordFsm = new WordCommitFSM(wordSmoother, WORD_COOLDOWN_SECONDS);
+const wordBuffer = new WordBuffer(WORD_SENTENCE_PAUSE_FRAMES);
+let wordFrames = [];     // Float32Array(130) per frame, capped at WORD_BUFFER_FRAMES
+
+let activeMode = MODES[DEFAULT_MODE];
+const modelCache = {};   // mode id -> DenseModel | TCNModel
+const labelsCache = {};  // mode id -> {0: "A", ...}
+let model = null;        // active mode's model (modelCache[activeMode.id])
+let labels = null;       // active mode's labels
 let landmarker = null;
+let poseLandmarker = null; // lazily created on first entry to word mode
+let vision = null;         // FilesetResolver, shared by both landmarkers
 let drawer = null;
 let video = null;
 let lastFrameTimes = [];
 
+function resetWordState() {
+  wordFrames = [];
+  wordFsm.reset();
+  wordBuffer.clear();
+}
+
 els.clearBtn.addEventListener("click", () => {
-  letterBuffer.clear();
+  charBuffer.clear();
+  resetWordState();
   els.strip.textContent = "";
 });
 
@@ -93,10 +146,138 @@ function classify(flat63, aspect) {
     .map((i) => ({ prediction: labels[i], confidence: probs[i] }));
   const top1Conf = probs[order[0]];
   return {
-    prediction: top1Conf >= LETTER_CONFIDENCE_THRESHOLD ? labels[order[0]] : null,
+    prediction: top1Conf >= activeMode.acceptThreshold ? labels[order[0]] : null,
     confidence: top1Conf,
     top3,
   };
+}
+
+/** Flatten one MediaPipe hand (21 points) to [x,y,z,...] — the order
+ *  src/detector.py builds landmarks in. */
+function flattenHand(hand) {
+  const flat = new Array(63);
+  for (let i = 0; i < 21; i++) {
+    flat[i * 3] = hand[i].x;
+    flat[i * 3 + 1] = hand[i].y;
+    flat[i * 3 + 2] = hand[i].z;
+  }
+  return flat;
+}
+
+// ---- Static per-frame (letters, numbers) ----
+function processStaticFrame(result, w, h) {
+  const hand = result.landmarks && result.landmarks[0];
+  let clsResult = null;
+  if (hand) {
+    drawer.drawConnectors(hand, HandLandmarker.HAND_CONNECTIONS,
+                          { color: "#ffffff", lineWidth: 2 });
+    drawer.drawLandmarks(hand, { color: "#ffd900", radius: 3 });
+    clsResult = classify(flattenHand(hand), w / h);
+    smoother.update(clsResult.prediction);
+    setStatus("");
+  } else {
+    smoother.update(null);
+    setStatus("waiting for hand…");
+  }
+  const stable = smoother.getStable();
+  if (charBuffer.update(stable)) {
+    els.strip.textContent = charBuffer.getText();
+  }
+  updateHud(stable, clsResult);
+}
+
+// ---- Word per-frame (dynamic signs) ----
+// Mirrors classifier._update_word_buffer/_run_words + main.py's word FSM: build
+// a body-anchored feature every frame, keep a rolling buffer, and only classify
+// (resample -> TCN) while the hands are actually moving. Pose runs on the SAME
+// mirrored canvas so shoulders and wrists share one coordinate space, and
+// mirror-before-detect makes the Left/Right handedness labels match training.
+function processWordFrame(result, now, w, h) {
+  const aspect = w / h;
+
+  // Shoulders from pose (body anchor). Missing pose -> no anchor (position 0),
+  // the same graceful degradation the desktop does when pose is unavailable.
+  let shoulderL = null, shoulderR = null;
+  if (poseLandmarker) {
+    const pose = poseLandmarker.detectForVideo(els.canvas, now);
+    const lm = pose.landmarks && pose.landmarks[0];
+    if (lm) {
+      shoulderL = [lm[POSE_LEFT_SHOULDER].x, lm[POSE_LEFT_SHOULDER].y];
+      shoulderR = [lm[POSE_RIGHT_SHOULDER].x, lm[POSE_RIGHT_SHOULDER].y];
+      drawShoulders(shoulderL, shoulderR, w, h);
+    }
+  }
+
+  // Hands by handedness so the same sign always lands in the same slot
+  // (parity with src/detector.py hands_by_side).
+  const hands = result.landmarks || [];
+  const handed = result.handedness || result.handednesses || [];
+  let leftHand = null, rightHand = null;
+  for (let i = 0; i < hands.length; i++) {
+    drawer.drawConnectors(hands[i], HandLandmarker.HAND_CONNECTIONS,
+                          { color: "#ffffff", lineWidth: 2 });
+    drawer.drawLandmarks(hands[i], { color: "#ffd900", radius: 3 });
+    const side = handed[i] && handed[i][0] && handed[i][0].categoryName;
+    const flat = flattenHand(hands[i]);
+    if (side === "Left") leftHand = flat;
+    else if (side === "Right") rightHand = flat;
+  }
+
+  const feat = buildWordFeatures(leftHand, rightHand, shoulderL, shoulderR, aspect);
+  wordFrames.push(feat);
+  if (wordFrames.length > WORD_BUFFER_FRAMES) wordFrames.shift();
+
+  // Classify only once the buffer has filled AND the hands are moving (a still
+  // pose is not a dynamic sign). The FSM still steps every frame with the
+  // resulting prediction (or null) so it can lock/unlock on cooldown.
+  let wordPred = null;
+  let isSigning = false;
+  if (wordFrames.length >= WORD_MIN_FRAMES) {
+    const motion = sequenceMotion(wordFrames, WORD_MOTION_WINDOW);
+    isSigning = motion >= WORD_MIN_MOTION_STD;
+    if (isSigning) {
+      const seq = resampleSequence(wordFrames, WORD_SEQ_LEN);
+      const probs = model.predict(seq);
+      let idx = 0;
+      for (let k = 1; k < probs.length; k++) if (probs[k] > probs[idx]) idx = k;
+      const conf = probs[idx];
+      const label = labels[idx];
+      // Commit only above threshold and not the negative "nothing" class.
+      if (conf >= activeMode.acceptThreshold && label !== WORD_NULL_LABEL) {
+        wordPred = { prediction: label, confidence: conf };
+      }
+    }
+  }
+
+  const { word, confidence, isNew } = wordFsm.step(wordPred, now / 1000);
+  if (isNew) wordBuffer.add(word);
+  wordBuffer.tick();
+  els.strip.textContent = wordBuffer.getText();
+
+  updateWordHud(word, confidence);
+  setStatus(isSigning ? "signing…" : (hands.length ? "" : "waiting for hand…"));
+}
+
+/** Draw the two shoulder anchors on the (already-mirrored) canvas. */
+function drawShoulders(shoulderL, shoulderR, w, h) {
+  ctx.fillStyle = "#ff7b00";
+  for (const s of [shoulderL, shoulderR]) {
+    ctx.beginPath();
+    ctx.arc(s[0] * w, s[1] * h, 6, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function updateWordHud(word, confidence) {
+  // The current sign, kept on screen during the cooldown lock-out. No hint
+  // style and no top-3 panel — words commit as whole units, not per frame.
+  els.letter.classList.remove("hint");
+  els.letter.textContent = word || "–";
+  const conf = word ? confidence : 0;
+  els.confBar.style.width = `${Math.round(conf * 100)}%`;
+  els.confBar.className = conf >= 0.8 ? "good" : conf >= 0.6 ? "mid" : "low";
+  els.confLabel.textContent = word ? `${Math.round(conf * 100)}%` : "";
+  els.alts.classList.add("hidden");
 }
 
 // ---- UI updates ----
@@ -171,34 +352,11 @@ function onFrame(now) {
     ctx.restore();
 
     const result = landmarker.detectForVideo(els.canvas, now);
-    const hand = result.landmarks && result.landmarks[0];
-
-    let clsResult = null;
-    if (hand) {
-      drawer.drawConnectors(hand, HandLandmarker.HAND_CONNECTIONS,
-                            { color: "#ffffff", lineWidth: 2 });
-      drawer.drawLandmarks(hand, { color: "#ffd900", radius: 3 });
-
-      // Flatten x,y,z — same order as src/detector.py builds landmarks_hand1.
-      const flat = new Array(63);
-      for (let i = 0; i < 21; i++) {
-        flat[i * 3] = hand[i].x;
-        flat[i * 3 + 1] = hand[i].y;
-        flat[i * 3 + 2] = hand[i].z;
-      }
-      clsResult = classify(flat, w / h);
-      smoother.update(clsResult.prediction);
-      setStatus("");
+    if (activeMode.kind === "sequence") {
+      processWordFrame(result, now, w, h);
     } else {
-      smoother.update(null);
-      setStatus("waiting for hand…");
+      processStaticFrame(result, w, h);
     }
-
-    const stable = smoother.getStable();
-    if (letterBuffer.update(stable)) {
-      els.strip.textContent = letterBuffer.getText();
-    }
-    updateHud(stable, clsResult);
     updateFps(now);
     consecutiveErrors = 0;
     framesSeen++;
@@ -338,6 +496,93 @@ els.cameraSel.addEventListener("change", async () => {
   }
 });
 
+// ---- Mode loading + switching ----
+// The three modes share the camera, the hand detector, and the mirror-then-
+// detect rule; a switch swaps the model, labels, threshold, and per-frame logic
+// (via `activeMode`). Each model is fetched once and cached, so toggling is
+// instant. The word model additionally needs the pose detector (lazy).
+async function loadMode(modeId) {
+  const mode = MODES[modeId];
+  if (!modelCache[modeId]) {
+    const loadModel = mode.kind === "sequence" ? loadWordModel : loadDenseModel;
+    const [m, l] = await Promise.all([
+      loadModel(mode.modelUrl),
+      fetch(mode.labelsUrl).then((r) => {
+        if (!r.ok) throw new Error(`labels ${r.status}`);
+        return r.json();
+      }),
+    ]);
+    modelCache[modeId] = m;
+    labelsCache[modeId] = l;
+  }
+  // Word mode needs the pose detector for the body anchor — created once here.
+  if (mode.kind === "sequence") await ensurePose();
+}
+
+/** Create the pose landmarker once, on first entry to word mode. Non-fatal: a
+ *  pose failure degrades word features (position anchor -> 0) but keeps the
+ *  handshape working, the same graceful degradation as the desktop app. */
+async function ensurePose() {
+  if (poseLandmarker || !vision) return;
+  const options = {
+    baseOptions: { modelAssetPath: POSE_TASK_URL, delegate: "GPU" },
+    runningMode: "VIDEO",
+    numPoses: 1,
+  };
+  try {
+    poseLandmarker = await PoseLandmarker.createFromOptions(vision, options);
+  } catch {
+    try {
+      options.baseOptions.delegate = "CPU"; // no usable GPU delegate -> CPU
+      poseLandmarker = await PoseLandmarker.createFromOptions(vision, options);
+    } catch (err) {
+      console.warn("Pose detector unavailable; word signs will lose the body "
+                   + "anchor (handshape only).", err);
+    }
+  }
+}
+
+function applyModeUi(mode) {
+  els.heading.textContent = mode.heading;
+  els.footer.textContent = mode.footer;
+  els.modeBtns.forEach((b) => {
+    const on = b.dataset.mode === mode.id;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-pressed", on ? "true" : "false");
+  });
+}
+
+async function switchMode(modeId) {
+  if (modeId === activeMode.id || !MODES[modeId]) return;
+  els.modeBtns.forEach((b) => (b.disabled = true));
+  try {
+    setStatus(`loading ${MODES[modeId].label.toLowerCase()}…`);
+    await loadMode(modeId);
+    activeMode = MODES[modeId];
+    model = modelCache[modeId];
+    labels = labelsCache[modeId];
+    // Fresh mode, fresh votes and strip — mirrors main.py resetting the
+    // smoother, buffer and word FSM when the desktop app changes mode.
+    smoother.reset();
+    charBuffer.clear();
+    resetWordState();
+    els.strip.textContent = "";
+    applyModeUi(activeMode);
+    setStatus("waiting for hand…");
+  } catch (err) {
+    // A failed switch must not leave the app modeless: activeMode was not
+    // reassigned (the load threw first), so we stay on the previous mode.
+    console.error("Mode switch failed:", err);
+    applyModeUi(activeMode);
+    setStatus(`could not load ${MODES[modeId].label} — kept ${activeMode.label}`, true);
+  } finally {
+    els.modeBtns.forEach((b) => (b.disabled = false));
+  }
+}
+
+els.modeBtns.forEach((b) =>
+  b.addEventListener("click", () => switchMode(b.dataset.mode)));
+
 // ---- Boot ----
 async function main() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -347,16 +592,14 @@ async function main() {
 
   try {
     setStatus("loading model…");
-    [model, labels] = await Promise.all([
-      loadLettersModel(MODEL_URL),
-      fetch(LABELS_URL).then((r) => {
-        if (!r.ok) throw new Error(`labels ${r.status}`);
-        return r.json();
-      }),
-    ]);
+    await loadMode(activeMode.id);
+    model = modelCache[activeMode.id];
+    labels = labelsCache[activeMode.id];
+    applyModeUi(activeMode);
 
     setStatus("loading hand detector…");
-    const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_URL);
+    // Module-scoped so ensurePose() can reuse it when word mode is first entered.
+    vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_URL);
     const options = {
       baseOptions: { modelAssetPath: HAND_TASK_URL, delegate: "GPU" },
       runningMode: "VIDEO",

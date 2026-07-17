@@ -88,26 +88,28 @@ export class PredictionSmoother {
 }
 
 /**
- * Spelled-letters strip. Port of src/overlay.py::LetterBuffer, minus
- * del/space handling: the letters model has 24 classes (A-Y, no J/Z) and no
- * del/space classes, so the web UI uses a clear button instead.
- * Same cadence rule: once a letter is accepted, nothing else is accepted
- * until cooldownFrames pass (a held pose repeats every ~0.67s, not per frame).
+ * Accumulated-characters strip. Port of src/overlay.py::LetterBuffer, minus
+ * del/space handling: the static models (letters A-Y no J/Z, digits 0-9) have
+ * no del/space classes, so the web UI uses a clear button instead. Shared by
+ * letters and numbers modes — it just collects whatever stable character the
+ * active model emits. Same cadence rule: once a character is accepted, nothing
+ * else is accepted until cooldownFrames pass (a held pose repeats every
+ * ~0.67s, not per frame).
  */
-export class LetterBuffer {
+export class CharBuffer {
   constructor(cooldownFrames) {
     this._chars = [];
     this._cooldown = 0;
     this._cooldownFrames = cooldownFrames;
   }
 
-  /** Offer the current stable letter (or null). True if accepted this frame. */
-  update(letter) {
+  /** Offer the current stable character (or null). True if accepted this frame. */
+  update(ch) {
     if (this._cooldown > 0) this._cooldown--;
-    if (letter === null || letter === undefined || this._cooldown > 0) {
+    if (ch === null || ch === undefined || this._cooldown > 0) {
       return false;
     }
-    this._chars.push(letter.toUpperCase());
+    this._chars.push(ch.toUpperCase());
     this._cooldown = this._cooldownFrames;
     return true;
   }
@@ -119,5 +121,209 @@ export class LetterBuffer {
   clear() {
     this._chars.length = 0;
     this._cooldown = 0;
+  }
+}
+
+// ===========================================================================
+// WORD pipeline (dynamic signs) — ports of src/utils.py's word helpers and the
+// desktop word-mode glue. PARITY RULE applies here too: buildWordFeatures /
+// wordFeaturesFromRaw / resampleSequence must match Python exactly (gated by
+// web/fixtures/words/*). Letters/numbers do not use any of this.
+// ===========================================================================
+
+export const WORD_FEATURE_LEN = 130;    // src.utils.WORD_FEATURE_LEN
+export const WORD_RAW_FRAME_LEN = 131;  // src.utils.WORD_RAW_FRAME_LEN
+const _HAND_BLOCK_LEN = 65;             // 63 shape + 2 body-relative wrist pos
+
+/**
+ * One hand's 65-value block. Port of src/utils.py::_hand_block.
+ * `handFlat` is a 63-value raw landmark array or null; `frame` is
+ * [cx, cy, scale] in width units or null (no body anchor); `aspect` un-stretches.
+ * Missing hand -> zeros; no body frame -> position part 0 (never the raw
+ * on-screen coordinate — that would leak absolute position).
+ */
+function _handBlock(handFlat, frame, aspect) {
+  const out = new Float32Array(_HAND_BLOCK_LEN);
+  if (handFlat === null || handFlat === undefined) return out; // zeros = absent
+  out.set(normalizeLandmarks(handFlat, aspect), 0);            // 63 handshape
+  if (frame !== null) {
+    const [cx, cy, scale] = frame;
+    out[63] = (handFlat[0] - cx) / scale;             // raw wrist x
+    out[64] = (handFlat[1] / aspect - cy) / scale;    // raw wrist y (un-stretched)
+  }
+  return out;
+}
+
+/**
+ * Full (130,) body-anchored two-hand word feature for one frame.
+ * Port of src/utils.py::build_word_features. `aspect` is MANDATORY (same as
+ * Python) so a forgotten call site fails loudly instead of silently
+ * reintroducing the per-axis geometry bug.
+ */
+export function buildWordFeatures(leftHand, rightHand, shoulderL, shoulderR, aspect) {
+  if (aspect === undefined || aspect === null) {
+    throw new Error("buildWordFeatures requires the frame aspect ratio (width/height).");
+  }
+  // Body frame in WIDTH UNITS: un-stretch every y before any geometry, so the
+  // anchor (center + shoulder-width scale) is camera-orientation invariant.
+  let frame = null;
+  if (shoulderL && shoulderR) {
+    const cx = (shoulderL[0] + shoulderR[0]) * 0.5;
+    const cy = (shoulderL[1] / aspect + shoulderR[1] / aspect) * 0.5;
+    let scale = Math.hypot(shoulderL[0] - shoulderR[0],
+                           (shoulderL[1] - shoulderR[1]) / aspect);
+    if (scale < 1e-6) scale = 1.0;
+    frame = [cx, cy, scale];
+  }
+  const out = new Float32Array(WORD_FEATURE_LEN);
+  out.set(_handBlock(leftHand, frame, aspect), 0);
+  out.set(_handBlock(rightHand, frame, aspect), _HAND_BLOCK_LEN);
+  return out;
+}
+
+/**
+ * Turn one stored raw capture row (131) back into a (130) feature vector.
+ * Port of src/utils.py::word_features_from_raw. All-zero blocks map to
+ * null/absent (MediaPipe never emits an exact all-zero block).
+ */
+export function wordFeaturesFromRaw(row) {
+  if (row.length !== WORD_RAW_FRAME_LEN) {
+    throw new Error(`Raw word frame must have ${WORD_RAW_FRAME_LEN} values, got ${row.length}.`);
+  }
+  const anyNonZero = (a, lo, hi) => {
+    for (let i = lo; i < hi; i++) if (a[i] !== 0) return true;
+    return false;
+  };
+  const left  = anyNonZero(row, 0, 63)    ? row.slice(0, 63)   : null;
+  const right = anyNonZero(row, 63, 126)  ? row.slice(63, 126) : null;
+  const shL   = anyNonZero(row, 126, 128) ? [row[126], row[127]] : null;
+  const shR   = anyNonZero(row, 128, 130) ? [row[128], row[129]] : null;
+  return buildWordFeatures(left, right, shL, shR, row[130]);
+}
+
+/**
+ * numpy-compatible round (half-to-even). Math.round rounds .5 toward +Inf,
+ * which would disagree with np.round at exact half-integers; resampleSequence
+ * relies on matching numpy's index picking, so use half-to-even here.
+ */
+function npRound(x) {
+  const floor = Math.floor(x);
+  const diff = x - floor;
+  if (diff < 0.5) return floor;
+  if (diff > 0.5) return floor + 1;
+  return floor % 2 === 0 ? floor : floor + 1; // exactly .5 -> nearest even
+}
+
+/**
+ * Resample a list of equal-length frame rows to exactly `n`, evenly spaced.
+ * Port of src/utils.py::resample_sequence (np.linspace(0, len-1, n).round()).
+ * Index-picking (no interpolation), so it commutes with per-frame featurization.
+ */
+export function resampleSequence(frames, n) {
+  const len = frames.length;
+  if (len === 0) throw new Error("Cannot resample an empty sequence.");
+  const out = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const pos = n === 1 ? 0 : (len - 1) * i / (n - 1);
+    out[i] = frames[npRound(pos)];
+  }
+  return out;
+}
+
+/**
+ * Mean over feature dims of the per-dim std of the last `window` frames.
+ * Port of the motion test in src/classifier.py::_run_words (population std,
+ * numpy default ddof=0). Used to decide whether the hand is actively signing.
+ */
+export function sequenceMotion(frames, window) {
+  const recent = frames.slice(-window);
+  const T = recent.length;
+  if (T === 0) return 0;
+  const D = recent[0].length;
+  let total = 0;
+  for (let d = 0; d < D; d++) {
+    let mean = 0;
+    for (let t = 0; t < T; t++) mean += recent[t][d];
+    mean /= T;
+    let variance = 0;
+    for (let t = 0; t < T; t++) { const diff = recent[t][d] - mean; variance += diff * diff; }
+    total += Math.sqrt(variance / T);
+  }
+  return total / D;
+}
+
+/**
+ * Vote -> confirm -> lock-out state machine for dynamic word signs.
+ * Port of main.py::WordCommitFSM. Owns a PredictionSmoother plus a cooldown
+ * clock (seconds). step() returns { word, confidence, isNew }; isNew is true
+ * only on the frame a fresh sign is committed (the moment to append/speak it).
+ */
+export class WordCommitFSM {
+  constructor(smoother, cooldownSeconds) {
+    this._smoother = smoother;
+    this._cooldown = cooldownSeconds;
+    this.reset();
+  }
+
+  reset() {
+    this._smoother.reset();
+    this._locked = null;
+    this._lockedConf = 0.0;
+    this._cooldownUntil = 0.0;
+  }
+
+  /** @param wordPred {prediction,confidence}|null  @param now seconds */
+  step(wordPred, now) {
+    if (now < this._cooldownUntil) {
+      this._smoother.reset();
+      return { word: this._locked, confidence: this._lockedConf, isNew: false };
+    }
+    this._locked = null;
+    this._smoother.update(wordPred ? wordPred.prediction : null);
+    const stable = this._smoother.getStable();
+    if (stable !== null) {
+      this._locked = stable;
+      this._lockedConf = wordPred ? wordPred.confidence : 0.0;
+      this._cooldownUntil = now + this._cooldown;
+      return { word: stable, confidence: this._lockedConf, isNew: true };
+    }
+    return { word: null, confidence: 0.0, isNew: false };
+  }
+}
+
+/**
+ * Running sentence of recognized signs. Port of src/overlay.py::WordBuffer:
+ * each detected sign is appended; the sentence auto-clears after
+ * sentencePauseFrames with no new sign (just pause to start fresh).
+ */
+export class WordBuffer {
+  constructor(sentencePauseFrames) {
+    this._words = [];
+    this._idle = 0;
+    this._pause = sentencePauseFrames;
+  }
+
+  /** Append a detected sign; returns it, or null for empty. */
+  add(word) {
+    if (!word) return null;
+    this._words.push(word);
+    this._idle = 0;
+    return word;
+  }
+
+  /** Advance the inactivity timer; auto-clear after the pause window. */
+  tick() {
+    if (this._words.length === 0) return;
+    this._idle++;
+    if (this._idle >= this._pause) this.clear();
+  }
+
+  getText() {
+    return this._words.join(" ");
+  }
+
+  clear() {
+    this._words.length = 0;
+    this._idle = 0;
   }
 }
