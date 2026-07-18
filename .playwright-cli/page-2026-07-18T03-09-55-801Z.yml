@@ -1,0 +1,11 @@
+- generic [active] [ref=e1]:
+  - heading "Sign Language Translator — ASL letters, in your browser" [level=1] [ref=e2]
+  - group "Recognition mode" [ref=e3]:
+    - button "Letters" [pressed] [ref=e4] [cursor=pointer]
+    - button "Numbers" [ref=e5] [cursor=pointer]
+    - button "Words" [ref=e6] [cursor=pointer]
+  - generic [ref=e10]: Camera permission denied. Allow the camera and reload.
+  - generic [ref=e13]: –
+  - text: "unsure — top 3:"
+  - button "Clear" [ref=e18] [cursor=pointer]
+  - contentinfo [ref=e19]: Static ASL letters A–Y (J and Z need motion — desktop version roadmap). Everything runs locally in your browser; no video leaves your device.

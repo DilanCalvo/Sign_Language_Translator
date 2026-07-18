@@ -30,7 +30,7 @@ export const WORD_MOTION_WINDOW = 8;             // WORD_MOTION_WINDOW
 export const WORD_MIN_MOTION_STD = 0.020;        // WORD_MIN_MOTION_STD (is-signing gate)
 export const WORD_SMOOTH_WINDOW = 5;             // WORD_SMOOTH_WINDOW
 export const WORD_SMOOTH_MIN_VOTES = 3;          // WORD_SMOOTH_MIN_VOTES
-export const WORD_COOLDOWN_SECONDS = 2.0;        // WORD_COOLDOWN_SECONDS
+export const WORD_COOLDOWN_SECONDS = 1.0;        // WORD_COOLDOWN_SECONDS
 export const WORD_SENTENCE_PAUSE_FRAMES = 150;   // WORD_SENTENCE_PAUSE_FRAMES (auto-clear)
 export const WORD_NULL_LABEL = "nothing";        // WORD_NULL_LABEL (negative class)
 

@@ -128,6 +128,18 @@ const POSE_EVERY_N = 3;
 let poseFrameCounter = 0;
 let lastShoulderL = null, lastShoulderR = null;
 
+// The TCN is the heaviest per-frame cost in word mode, but the rolling buffer
+// shifts by one frame at a time, so consecutive predictions barely differ —
+// the same premise as the pose throttle above. While the hands are actively
+// signing we run the (expensive) resample + TCN only every WORD_INFER_EVERY_N
+// frames and reuse the last softmax in between. The word FSM is still stepped
+// every frame with the resulting prediction, so commit timing and smoothing are
+// unchanged. The cadence counter and cached probs reset between signing bursts
+// (and when the hands leave) so a fresh burst never reuses a stale prediction.
+const WORD_INFER_EVERY_N = 2;
+let wordInferCounter = 0;
+let lastWordProbs = null;   // Float32Array softmax reused on skipped frames
+
 let activeMode = MODES[DEFAULT_MODE];
 const modelCache = {};   // mode id -> DenseModel | TCNModel
 const labelsCache = {};  // mode id -> {0: "A", ...}
@@ -157,6 +169,8 @@ function resetWordState() {
   poseFrameCounter = 0;
   lastShoulderL = null;
   lastShoulderR = null;
+  wordInferCounter = 0;
+  lastWordProbs = null;
 }
 
 els.clearBtn.addEventListener("click", () => {
@@ -237,6 +251,10 @@ function processWordFrame(result, now, w, h) {
   // and pose is skipped entirely — same early-out as the desktop's _empty().
   if (hands.length === 0) {
     wordFrames = [];
+    // Buffer just emptied -> any cached softmax is stale; force a fresh infer
+    // (and cadence restart) when signing resumes.
+    wordInferCounter = 0;
+    lastWordProbs = null;
     const { word, confidence } = wordFsm.step(null, now / 1000);
     wordBuffer.tick();
     els.strip.textContent = wordBuffer.getText();
@@ -292,8 +310,16 @@ function processWordFrame(result, now, w, h) {
     const motion = sequenceMotion(wordFrames, WORD_MOTION_WINDOW);
     isSigning = motion >= WORD_MIN_MOTION_STD;
     if (isSigning) {
-      const seq = resampleSequence(wordFrames, WORD_SEQ_LEN);
-      const probs = model.predict(seq);
+      // Throttle the resample + TCN to every WORD_INFER_EVERY_N signing frames,
+      // reusing the cached softmax in between (see WORD_INFER_EVERY_N above). A
+      // just-reset burst (lastWordProbs === null) always infers fresh first.
+      let probs = lastWordProbs;
+      if (probs === null || wordInferCounter % WORD_INFER_EVERY_N === 0) {
+        const seq = resampleSequence(wordFrames, WORD_SEQ_LEN);
+        probs = model.predict(seq);
+        lastWordProbs = probs;
+      }
+      wordInferCounter++;
       let idx = 0;
       for (let k = 1; k < probs.length; k++) if (probs[k] > probs[idx]) idx = k;
       const conf = probs[idx];
@@ -302,6 +328,11 @@ function processWordFrame(result, now, w, h) {
       if (conf >= activeMode.acceptThreshold && label !== WORD_NULL_LABEL) {
         wordPred = { prediction: label, confidence: conf };
       }
+    } else {
+      // Gap in signing -> restart the cadence and drop the cached probs so the
+      // next burst re-infers from the current buffer, not a stale one.
+      wordInferCounter = 0;
+      lastWordProbs = null;
     }
   }
 
@@ -680,15 +711,50 @@ async function main() {
   }
 
   try {
-    setStatus("loading model…");
-    await loadMode(activeMode.id);
+    setStatus("starting…");
+    // Fire the independent boot work concurrently instead of in series: the
+    // model weights, the MediaPipe WASM runtime (~9 MB) and camera acquisition
+    // do not depend on each other, so overlapping them (and, on first visit,
+    // the permission prompt with the ~17 MB of downloads) cuts time-to-first-
+    // frame. The AWAIT order below preserves every dependency and the serial
+    // code's exact error handling; only the START is overlapped.
+    const modePromise = loadMode(activeMode.id);
+    // Module-scoped so ensurePose() can reuse it when word mode is first entered.
+    const visionPromise = FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_URL);
+
+    // Camera setup can begin now; the prompt/warmup overlaps the downloads.
+    // Same saved-camera fallback + error semantics as the serial code, wrapped
+    // in a promise. A permission error is not a device problem, so it does not
+    // clear the saved choice.
+    video = els.cam;          // the native <video> shown (and CSS-mirrored) in #stage
+    video.playsInline = true; // iOS: play inline instead of fullscreen
+    video.muted = true;
+    const savedId = localStorage.getItem(CAMERA_STORE_KEY);
+    const cameraPromise = (async () => {
+      try {
+        await startCamera(savedId);
+      } catch (err) {
+        if (!savedId || err.name === "NotAllowedError") throw err;
+        localStorage.removeItem(CAMERA_STORE_KEY);
+        await startCamera(null);
+      }
+    })();
+    // If an earlier await below rejects we jump to catch without awaiting these;
+    // mark them handled so a late rejection is not reported as "unhandled". The
+    // awaits still surface the real error to the catch block.
+    modePromise.catch(() => {});
+    visionPromise.catch(() => {});
+    cameraPromise.catch(() => {});
+
+    // Model + labels (small): also settles the mode UI early.
+    await modePromise;
     model = modelCache[activeMode.id];
     labels = labelsCache[activeMode.id];
     applyModeUi(activeMode);
 
+    // Hand detector: needs the WASM runtime (vision), then loads its .task.
     setStatus("loading hand detector…");
-    // Module-scoped so ensurePose() can reuse it when word mode is first entered.
-    vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM_URL);
+    vision = await visionPromise;
     const options = {
       baseOptions: { modelAssetPath: HAND_TASK_URL, delegate: "GPU" },
       runningMode: "VIDEO",
@@ -708,22 +774,9 @@ async function main() {
     }
     drawer = new DrawingUtils(ctx);
 
+    // Camera must be ready before the loop reads frames from it.
     setStatus("requesting camera…");
-    video = els.cam;          // the native <video> shown (and CSS-mirrored) in #stage
-    video.playsInline = true; // iOS: play inline instead of fullscreen
-    video.muted = true;
-
-    // Prefer the camera the user picked last time; if it is gone (unplugged)
-    // fall back to the default instead of dying. A permission error is not a
-    // device problem, so it does not clear the saved choice.
-    const savedId = localStorage.getItem(CAMERA_STORE_KEY);
-    try {
-      await startCamera(savedId);
-    } catch (err) {
-      if (!savedId || err.name === "NotAllowedError") throw err;
-      localStorage.removeItem(CAMERA_STORE_KEY);
-      await startCamera(null);
-    }
+    await cameraPromise;
 
     // Device labels only exist after permission was granted, so the selector
     // is built now, not at page load. Refresh it if cameras (un)plug.

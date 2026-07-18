@@ -22,6 +22,32 @@ function decodeF32(b64) {
   return new Float32Array(bytes.buffer); // base64 payload is little-endian f32
 }
 
+/**
+ * Fold inference-mode BatchNorm into one multiply-add per channel, computed
+ * once at load from the constant gamma/beta/mean/variance:
+ *   y = gamma*(x-mean)/sqrt(var+eps) + beta = x*scale + shift
+ * with scale = gamma/sqrt(var+eps) and shift = beta - mean*scale. This lifts
+ * the per-element sqrt/div out of the per-frame path (they only depend on the
+ * fixed weights). scale/shift are kept in float64 so the folded form stays
+ * within ~1 ULP of the original Keras expression — the parity gate (1e-4)
+ * covers it. Shared by both models so the two constructors stay identical.
+ */
+function decodeBatchNorm(l) {
+  const gamma = decodeF32(l.gamma);
+  const beta = decodeF32(l.beta);
+  const mean = decodeF32(l.mean);
+  const variance = decodeF32(l.variance);
+  const eps = l.epsilon;
+  const n = gamma.length;
+  const scale = new Float64Array(n);
+  const shift = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    scale[i] = gamma[i] / Math.sqrt(variance[i] + eps);
+    shift[i] = beta[i] - mean[i] * scale[i];
+  }
+  return { ...l, _scale: scale, _shift: shift };
+}
+
 function dense(x, layer) {
   const [nIn, nOut] = layer.kernel_shape;
   const out = new Float32Array(nOut);
@@ -47,12 +73,11 @@ function dense(x, layer) {
 }
 
 function batchnorm(x, layer) {
-  // Inference-mode BN: y = gamma * (x - mean) / sqrt(var + eps) + beta.
+  // Inference-mode BN as one multiply-add per channel; scale/shift were folded
+  // from gamma/beta/mean/variance at load (see decodeBatchNorm).
   const out = new Float32Array(x.length);
-  const { _gamma: g, _beta: b, _mean: m, _variance: v, epsilon: eps } = layer;
-  for (let i = 0; i < x.length; i++) {
-    out[i] = g[i] * (x[i] - m[i]) / Math.sqrt(v[i] + eps) + b[i];
-  }
+  const s = layer._scale, sh = layer._shift;
+  for (let i = 0; i < x.length; i++) out[i] = x[i] * s[i] + sh[i];
   return out;
 }
 
@@ -61,15 +86,11 @@ export class DenseModel {
     this.inputDim = spec.input_dim;
     this.numClasses = spec.num_classes;
     this._layers = spec.layers.map((l) => {
+      if (l.type === "batchnorm") return decodeBatchNorm(l);
       const decoded = { ...l };
       if (l.type === "dense") {
         decoded._kernel = decodeF32(l.kernel);
         decoded._bias = decodeF32(l.bias);
-      } else if (l.type === "batchnorm") {
-        decoded._gamma = decodeF32(l.gamma);
-        decoded._beta = decodeF32(l.beta);
-        decoded._mean = decodeF32(l.mean);
-        decoded._variance = decodeF32(l.variance);
       } else {
         throw new Error(`Unknown layer type in weight file: ${l.type}`);
       }
@@ -152,15 +173,11 @@ export class TCNModel {
     this.featureDim = spec.feature_dim;
     this.numClasses = spec.num_classes;
     this._layers = spec.layers.map((l) => {
+      if (l.type === "batchnorm") return decodeBatchNorm(l);
       const decoded = { ...l };
       if (l.type === "conv1d" || l.type === "dense") {
         decoded._kernel = decodeF32(l.kernel);
         decoded._bias = decodeF32(l.bias);
-      } else if (l.type === "batchnorm") {
-        decoded._gamma = decodeF32(l.gamma);
-        decoded._beta = decodeF32(l.beta);
-        decoded._mean = decodeF32(l.mean);
-        decoded._variance = decodeF32(l.variance);
       } else if (l.type === "global_avg_pool1d") {
         // no weights
       } else {
