@@ -61,12 +61,12 @@ from src.utils import pack_word_raw
 #
 # Curated for: (1) conversational frequency, (2) being visually DISTINCT so the
 # model can separate them. Start small (~12-15) and grow in blocks of ~5 once
-# accuracy holds. Edit this list freely; already-captured words are auto-skipped
+# accuracy holds. Edit tis list freely; already-captured words are auto-skipped
 # once they reach the target, so adding a word and re-running only records the
 # new one.
 # -------------------------------------------------------------------
 WORDS = [
-    "yes", "no", "hello", "thanks", "please", "sorry",
+    "that", "let", "yes", "no", "hello", "thanks", "please", "sorry",
     "want", "need", "help", "eat", "drink", "more",
     "good", "finished", "you", "me", 
     _NEGATIVE_LABEL,   # <- capture MANY varied non-signs for this one

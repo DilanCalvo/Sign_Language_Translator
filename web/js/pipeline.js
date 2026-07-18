@@ -225,6 +225,25 @@ function processStaticFrame(result, w, h) {
 // mirror-before-detect makes the Left/Right handedness labels match training.
 function processWordFrame(result, now, w, h) {
   const aspect = w / h;
+  const hands = result.landmarks || [];
+
+  // No hand in frame: mirror the desktop, which clears the word buffer when
+  // num_hands == 0 (src/classifier.py:182). Without this the previous sign's
+  // frames linger in wordFrames (up to WORD_BUFFER_FRAMES ~= 2s) and contaminate
+  // the next sign — the "residue" where a new sign re-predicts the last word.
+  // Still step the FSM with null so the cooldown clock advances and the locked
+  // word decays, exactly like main.py's word_fsm.step(None, ...) every frame.
+  // Shoulders stay cached (they are still there while the hand is off-screen),
+  // and pose is skipped entirely — same early-out as the desktop's _empty().
+  if (hands.length === 0) {
+    wordFrames = [];
+    const { word, confidence } = wordFsm.step(null, now / 1000);
+    wordBuffer.tick();
+    els.strip.textContent = wordBuffer.getText();
+    updateWordHud(word, confidence);
+    setStatus("waiting for hand…");
+    return;
+  }
 
   // Shoulders from pose (body anchor), throttled to every POSE_EVERY_N frames
   // and reusing the last result in between (shoulders barely move). Runs on the
@@ -248,7 +267,6 @@ function processWordFrame(result, now, w, h) {
 
   // Hands by handedness so the same sign always lands in the same slot
   // (parity with src/detector.py hands_by_side).
-  const hands = result.landmarks || [];
   const handed = result.handedness || result.handednesses || [];
   let leftHand = null, rightHand = null;
   for (let i = 0; i < hands.length; i++) {
@@ -379,6 +397,7 @@ function updateDebug() {
     `hand: ${handDelegate}\n` +
     `pose: ${poseDelegate}\n` +
     `cam:  ${res}\n` +
+    `buf:  ${wordFrames.length}\n` +   // word buffer size (0 with no hand -> no residue)
     `fps:  ${els.fps.textContent || "?"}`;
 }
 
