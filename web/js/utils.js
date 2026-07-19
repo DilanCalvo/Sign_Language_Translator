@@ -253,10 +253,29 @@ export function sequenceMotion(frames, window) {
 }
 
 /**
- * Vote -> confirm -> lock-out state machine for dynamic word signs.
- * Port of main.py::WordCommitFSM. Owns a PredictionSmoother plus a cooldown
- * clock (seconds). step() returns { word, confidence, isNew }; isNew is true
- * only on the frame a fresh sign is committed (the moment to append/speak it).
+ * Vote -> confirm -> repeat-guard state machine for dynamic word signs.
+ * Owns a PredictionSmoother plus a guard clock (seconds). step() returns
+ * { word, confidence, isNew }; isNew is true only on the frame a fresh sign is
+ * committed (the moment to append/speak it).
+ *
+ * DELIBERATE DIVERGENCE from main.py::WordCommitFSM (web-only, 2026-07-18):
+ * the desktop FSM blocks EVERY commit for cooldownSeconds after a sign, so the
+ * user waits out a dead time between signs and cannot hold a conversation at
+ * speaking pace. Here the guard blocks only a REPEAT of the sign just
+ * committed:
+ *
+ *   - A DIFFERENT sign commits immediately  -> WANT -> DRINK -> NOW chains fast.
+ *   - The SAME sign held commits exactly ONCE (the desktop re-fired it every
+ *     cooldown window), and may be signed again after it is released.
+ *   - cooldownSeconds is no longer a lock-out: it is the display hold (how long
+ *     the sign stays on the HUD) and the release debounce (how long the sign
+ *     must be gone before the same one counts as new), so a brief detection gap
+ *     mid-sign cannot duplicate a word.
+ *
+ * The smoother is deliberately NOT reset on commit: its votes for the incoming
+ * sign keep accumulating, which is what lets the next distinct sign land fast.
+ * Jitter protection therefore rests entirely on the smoother's minVotes rather
+ * than on a dead time — raise WORD_SMOOTH_MIN_VOTES if spurious words appear.
  */
 export class WordCommitFSM {
   constructor(smoother, cooldownSeconds) {
@@ -270,23 +289,35 @@ export class WordCommitFSM {
     this._locked = null;
     this._lockedConf = 0.0;
     this._cooldownUntil = 0.0;
+    this._lastWord = null;  // sign holding the repeat guard (null = guard open)
   }
 
   /** @param wordPred {prediction,confidence}|null  @param now seconds */
   step(wordPred, now) {
+    this._smoother.update(wordPred ? wordPred.prediction : null);
+    const stable = this._smoother.getStable();
+
+    if (stable !== null) {
+      if (stable !== this._lastWord) {
+        // Different from the sign under guard -> commit right away.
+        this._lastWord = stable;
+        this._locked = stable;
+        this._lockedConf = wordPred ? wordPred.confidence : 0.0;
+        this._cooldownUntil = now + this._cooldown;
+        return { word: stable, confidence: this._lockedConf, isNew: true };
+      }
+      // Same sign still being held: keep it on screen, do not re-commit.
+      return { word: this._locked, confidence: this._lockedConf, isNew: false };
+    }
+
+    // No stable sign (released, or mid-transition between two signs).
     if (now < this._cooldownUntil) {
-      this._smoother.reset();
+      // Inside the hold window: keep showing the sign AND keep the guard armed,
+      // so a momentary detection gap does not re-commit the same word.
       return { word: this._locked, confidence: this._lockedConf, isNew: false };
     }
     this._locked = null;
-    this._smoother.update(wordPred ? wordPred.prediction : null);
-    const stable = this._smoother.getStable();
-    if (stable !== null) {
-      this._locked = stable;
-      this._lockedConf = wordPred ? wordPred.confidence : 0.0;
-      this._cooldownUntil = now + this._cooldown;
-      return { word: stable, confidence: this._lockedConf, isNew: true };
-    }
+    this._lastWord = null;  // released long enough -> the same sign may repeat
     return { word: null, confidence: 0.0, isNew: false };
   }
 }
