@@ -24,19 +24,29 @@
 import {
   LOW_CONFIDENCE_THRESHOLD,
   ALT_MIN_CONFIDENCE,
-  LETTER_SMOOTH_WINDOW,
-  LETTER_SMOOTH_MIN_VOTES,
-  LETTER_COOLDOWN_FRAMES,
+  LETTER_SMOOTH_WINDOW_MS,
+  LETTER_SMOOTH_MIN_FRACTION,
+  LETTER_SMOOTH_MIN_SAMPLES,
+  LETTER_COOLDOWN_MS,
+  LETTER_WORD_CLOSE_MS,
+  CHAR_BUFFER_MAX_CHARS,
   WORD_SEQ_LEN,
-  WORD_BUFFER_FRAMES,
-  WORD_MIN_FRAMES,
-  WORD_MOTION_WINDOW,
+  WORD_FEATURE_DIM,
+  WORD_BUFFER_MS,
+  WORD_MIN_BUFFER_MS,
+  WORD_MIN_BUFFER_SAMPLES,
+  WORD_MOTION_WINDOW_MS,
   WORD_MIN_MOTION_STD,
-  WORD_SMOOTH_WINDOW,
-  WORD_SMOOTH_MIN_VOTES,
+  WORD_SMOOTH_WINDOW_MS,
+  WORD_SMOOTH_MIN_FRACTION,
+  WORD_SMOOTH_MIN_SAMPLES,
   WORD_COOLDOWN_SECONDS,
-  WORD_SENTENCE_PAUSE_FRAMES,
+  WORD_SENTENCE_PAUSE_MS,
   WORD_NULL_LABEL,
+  POSE_INTERVAL_MS,
+  WORD_INFER_INTERVAL_MS,
+  CAMERA_IDEAL_DESKTOP,
+  CAMERA_IDEAL_MOBILE,
   DETECTOR_MIN_DETECTION_CONFIDENCE,
   DETECTOR_MIN_PRESENCE_CONFIDENCE,
   DETECTOR_MIN_TRACKING_CONFIDENCE,
@@ -48,7 +58,7 @@ import {
 import { MODES, DEFAULT_MODE } from "./modes.js";
 import {
   normalizeLandmarks,
-  PredictionSmoother,
+  TimeSmoother,
   CharBuffer,
   buildWordFeatures,
   resampleSequence,
@@ -57,6 +67,9 @@ import {
   WordBuffer,
 } from "./utils.js";
 import { loadDenseModel, loadWordModel } from "./model.js";
+import { speech } from "./tts.js";
+import { conversation } from "./conversation.js";
+import { commitFeedback } from "./ui.js";
 // Vendored copy of @mediapipe/tasks-vision@0.10.14 (see web/vendor/): the app
 // must not depend on a CDN being reachable at demo time, and the runtime
 // version stays pinned to the one the .task files were validated with.
@@ -83,11 +96,34 @@ const els = {
   clearBtn: document.getElementById("clear"),
   fps: document.getElementById("fps"),
   cameraSel: document.getElementById("camera-select"),
+  cameraRow: document.getElementById("camera-row"),
+  camControl: document.getElementById("cam-control"),
+  camBtn: document.getElementById("cam-btn"),
+  camBtnLabel: document.getElementById("cam-btn-label"),
+  camMenu: document.getElementById("cam-menu"),
+  trackPill: document.getElementById("track-pill"),
+  trackText: document.getElementById("track-text"),
   modeBtns: document.querySelectorAll("#mode-toggle button"),
   heading: document.getElementById("heading"),
   footer: document.getElementById("footer"),
   cam: document.getElementById("cam"),
+  spaceBtn: document.getElementById("space-btn"),
+  stage: document.getElementById("stage"),
+  stageCol: document.getElementById("stage-col"),
 };
+
+/**
+ * Keep the stage from towering over the page when the camera is square or
+ * portrait (phone cameras, virtual cams): cap the displayed height at ~68vh
+ * by capping the width at aspect * 68vh. Landscape 16:9 streams are
+ * unaffected on normal screens.
+ *
+ * Published as a custom property because the stage bar and the action row cap
+ * to the same width, so they stay flush with the video edges.
+ */
+function fitStageToAspect(w, h) {
+  els.stageCol.style.setProperty("--stage-w", `calc(68vh * ${(w / h).toFixed(4)})`);
+}
 // `ctx` is the VISIBLE overlay canvas — it now draws ONLY the landmarks; the
 // camera itself is shown by the native <video> (#cam), which the browser
 // composites smoothly even while detectForVideo blocks the main thread.
@@ -100,45 +136,109 @@ const detectCanvas = document.createElement("canvas");
 // so a CPU-backed canvas would only add a copy.
 const detectCtx = detectCanvas.getContext("2d");
 
+// ---- Two status channels ----
+// These used to be one element in the middle of the video, which meant the
+// per-frame "waiting for hand…" / "signing…" sat on top of the user's own
+// hands and flickered at frame rate. They are different kinds of information
+// and now get different homes:
+//
+//   setStatus()   -> #status, centred OVER the video. BLOCKING states only
+//                    (boot, model load, camera trouble). Covering the frame is
+//                    correct here: there is nothing to see behind it.
+//   setTracking() -> #track-pill, in the bar ABOVE the video. The live channel.
+//                    Always present, only ever changes colour and label, so it
+//                    never covers the video and never shifts the layout.
+
+/** Bumped on every write so a flashed message knows if it is still the one showing. */
+let statusToken = 0;
+
 function setStatus(text, isError = false) {
+  statusToken++;
   els.status.textContent = text;
   els.status.classList.toggle("error", isError);
   els.status.classList.toggle("hidden", !text);
 }
 
+/** Show a recoverable error over the video, then clear it if nothing replaced it. */
+function flashStatus(text, ms = 4000) {
+  setStatus(text, true);
+  const mine = statusToken;
+  setTimeout(() => { if (statusToken === mine) setStatus(""); }, ms);
+}
+
+const TRACK_LABELS = {
+  busy: "Working…",
+  idle: "No hand",
+  ready: "Tracking",
+  signing: "Signing",
+};
+let trackState = null;
+
+function setTracking(state) {
+  if (state === trackState) return; // called every frame — touch the DOM only on change
+  trackState = state;
+  els.trackPill.dataset.state = state;
+  els.trackText.textContent = TRACK_LABELS[state];
+}
+
+// Display-only hysteresis. The motion gate chatters around its threshold, which
+// would strobe the pill between "Signing" and "Tracking" several times a second.
+// Holding the signing look briefly past the last moving frame is purely
+// cosmetic — the word FSM never sees this value.
+const SIGNING_HOLD_MS = 250;
+let signingUntil = 0;
+
 // ---- State ----
 // The static smoother/buffer serve letters + numbers (they hold no model-
 // specific state) — the same sharing the desktop app does. `activeMode` selects
 // the model/labels/threshold/kind; models are lazy-loaded and cached by id.
-const smoother = new PredictionSmoother(LETTER_SMOOTH_WINDOW, LETTER_SMOOTH_MIN_VOTES);
-const charBuffer = new CharBuffer(LETTER_COOLDOWN_FRAMES);
+const smoother = new TimeSmoother(
+  LETTER_SMOOTH_WINDOW_MS, LETTER_SMOOTH_MIN_FRACTION, LETTER_SMOOTH_MIN_SAMPLES);
+const charBuffer = new CharBuffer(
+  LETTER_COOLDOWN_MS, LETTER_WORD_CLOSE_MS, CHAR_BUFFER_MAX_CHARS);
 
 // Word (sequence) mode state: a rolling buffer of body-anchored feature frames,
 // a vote/confirm/lock-out state machine, and the running sentence. Only touched
 // when the active mode's kind is "sequence".
-const wordSmoother = new PredictionSmoother(WORD_SMOOTH_WINDOW, WORD_SMOOTH_MIN_VOTES);
+const wordSmoother = new TimeSmoother(
+  WORD_SMOOTH_WINDOW_MS, WORD_SMOOTH_MIN_FRACTION, WORD_SMOOTH_MIN_SAMPLES);
 const wordFsm = new WordCommitFSM(wordSmoother, WORD_COOLDOWN_SECONDS);
-const wordBuffer = new WordBuffer(WORD_SENTENCE_PAUSE_FRAMES);
-let wordFrames = [];     // Float32Array(130) per frame, capped at WORD_BUFFER_FRAMES
+const wordBuffer = new WordBuffer(WORD_SENTENCE_PAUSE_MS);
+// Rolling feature buffer: wordFrames[i] (Float32Array(130)) captured at
+// wordFrameTimes[i] ms; entries older than WORD_BUFFER_MS age out. Evicted
+// rows return to a free pool and are reused by buildWordFeatures(..., out) —
+// zero steady-state allocation. The pool naturally caps at the buffer's
+// frame capacity (~90 rows at 60fps).
+let wordFrames = [];
+let wordFrameTimes = [];
+const wordRowPool = [];
+
+/** Move every buffered row back to the pool (buffer reset, mode switch). */
+function recycleWordFrames() {
+  while (wordFrames.length) wordRowPool.push(wordFrames.pop());
+  wordFrameTimes.length = 0;
+}
 
 // Pose is the heaviest per-frame cost in word mode, but the shoulders barely
-// move, so we only run it every POSE_EVERY_N detection frames and reuse the last
-// shoulders in between — big compute/heat saving with negligible anchor error.
-const POSE_EVERY_N = 3;
-let poseFrameCounter = 0;
+// move, so we only run it every POSE_INTERVAL_MS and reuse the last shoulders
+// in between — big compute/heat saving with negligible anchor error.
+let lastPoseAt = -Infinity;
 let lastShoulderL = null, lastShoulderR = null;
 
 // The TCN is the heaviest per-frame cost in word mode, but the rolling buffer
 // shifts by one frame at a time, so consecutive predictions barely differ —
 // the same premise as the pose throttle above. While the hands are actively
-// signing we run the (expensive) resample + TCN only every WORD_INFER_EVERY_N
-// frames and reuse the last softmax in between. The word FSM is still stepped
-// every frame with the resulting prediction, so commit timing and smoothing are
-// unchanged. The cadence counter and cached probs reset between signing bursts
-// (and when the hands leave) so a fresh burst never reuses a stale prediction.
-const WORD_INFER_EVERY_N = 2;
-let wordInferCounter = 0;
-let lastWordProbs = null;   // Float32Array softmax reused on skipped frames
+// signing we run the (expensive) resample + TCN at most every
+// WORD_INFER_INTERVAL_MS and reuse the last softmax in between. The word FSM is
+// still stepped every frame with the resulting prediction, so commit timing and
+// smoothing are unchanged. The cached probs reset between signing bursts (and
+// when the hands leave) so a fresh burst never reuses a stale prediction.
+// lastWordProbs points at wordProbsCopy, OUR buffer — model.predict's return
+// is model-owned and only valid until the next predict, so it is copied at the
+// cache point (one preallocated copy, no per-infer allocation).
+let lastInferAt = -Infinity;
+let lastWordProbs = null;
+let wordProbsCopy = null;
 
 let activeMode = MODES[DEFAULT_MODE];
 const modelCache = {};   // mode id -> DenseModel | TCNModel
@@ -162,71 +262,123 @@ let handDelegate = "?";     // "GPU" | "CPU"
 let poseDelegate = "none";  // "GPU" | "CPU" | "failed" | "none"
 let debugEl = null;
 
+// Per-stage timings (EMA, ms) so the overlay shows WHERE the frame budget
+// goes on-device: mirror-draw, hand detect, pose detect, feature build, TCN.
+// Sampled only under ?debug — the normal path pays nothing.
+const perfMs = { draw: 0, hand: 0, pose: 0, feat: 0, tcn: 0 };
+function perfSample(stage, ms) {
+  perfMs[stage] = perfMs[stage] === 0 ? ms : perfMs[stage] * 0.9 + ms * 0.1;
+}
+
 function resetWordState() {
-  wordFrames = [];
+  recycleWordFrames();
   wordFsm.reset();
   wordBuffer.clear();
-  poseFrameCounter = 0;
+  lastPoseAt = -Infinity;
   lastShoulderL = null;
   lastShoulderR = null;
-  wordInferCounter = 0;
+  lastInferAt = -Infinity;
   lastWordProbs = null;
 }
 
 els.clearBtn.addEventListener("click", () => {
+  // Clear means DISCARD: the in-progress word and its pending closures go too.
   charBuffer.clear();
   resetWordState();
   els.strip.textContent = "";
+});
+
+/**
+ * Route finished fingerspelled words to voice + conversation. Words close via
+ * the Space button, the inactivity pause, or a mode switch; whatever the
+ * trigger, they all drain through here (mirrors main.py's
+ * pop_completed_words() loop).
+ */
+function drainSpelledWords() {
+  for (const word of charBuffer.popCompletedWords()) {
+    if (speech.letterMode === "word") speech.speak(word);
+    conversation.addSign(word);
+  }
+}
+
+els.spaceBtn.addEventListener("click", () => {
+  charBuffer.space();
+  els.strip.textContent = charBuffer.getText();
+  drainSpelledWords();
 });
 
 // ---- Replica of src/classifier.py::_run (top-3 + acceptance threshold) ----
 // `aspect` (frame width/height) lets normalizeLandmarks undo MediaPipe's
 // per-axis stretch — without it a portrait phone feeds the model differently
 // stretched vectors than the 16:9 data it was trained on.
+// Scratch for the normalized input (reused every frame; consumed by predict
+// before this function returns).
+const normScratch = new Float32Array(63);
+
 function classify(flat63, aspect) {
-  const probs = model.predict(normalizeLandmarks(flat63, aspect));
-  const order = [...probs.keys()].sort((a, b) => probs[b] - probs[a]);
-  const top3 = order.slice(0, 3)
-    .filter((i) => probs[i] >= ALT_MIN_CONFIDENCE)
-    .map((i) => ({ prediction: labels[i], confidence: probs[i] }));
-  const top1Conf = probs[order[0]];
+  const probs = model.predict(normalizeLandmarks(flat63, aspect, normScratch));
+  // Single-pass top-3 (replaces spread + full sort — this runs every frame).
+  let i0 = -1, i1 = -1, i2 = -1;
+  for (let i = 0; i < probs.length; i++) {
+    const p = probs[i];
+    if (i0 < 0 || p > probs[i0]) { i2 = i1; i1 = i0; i0 = i; }
+    else if (i1 < 0 || p > probs[i1]) { i2 = i1; i1 = i; }
+    else if (i2 < 0 || p > probs[i2]) { i2 = i; }
+  }
+  const top3 = [];
+  for (const i of [i0, i1, i2]) {
+    if (i >= 0 && probs[i] >= ALT_MIN_CONFIDENCE) {
+      top3.push({ prediction: labels[i], confidence: probs[i] });
+    }
+  }
+  const top1Conf = probs[i0];
   return {
-    prediction: top1Conf >= activeMode.acceptThreshold ? labels[order[0]] : null,
+    prediction: top1Conf >= activeMode.acceptThreshold ? labels[i0] : null,
     confidence: top1Conf,
     top3,
   };
 }
 
-/** Flatten one MediaPipe hand (21 points) to [x,y,z,...] — the order
- *  src/detector.py builds landmarks in. */
-function flattenHand(hand) {
-  const flat = new Array(63);
+/** Flatten one MediaPipe hand (21 points) into `out` as [x,y,z,...] — the
+ *  order src/detector.py builds landmarks in. `out` is a per-slot scratch
+ *  (consumed within the frame, never stored). */
+function flattenHand(hand, out) {
   for (let i = 0; i < 21; i++) {
-    flat[i * 3] = hand[i].x;
-    flat[i * 3 + 1] = hand[i].y;
-    flat[i * 3 + 2] = hand[i].z;
+    out[i * 3] = hand[i].x;
+    out[i * 3 + 1] = hand[i].y;
+    out[i * 3 + 2] = hand[i].z;
   }
-  return flat;
+  return out;
 }
+const staticFlatScratch = new Float32Array(63);
+const handFlatScratch = [new Float32Array(63), new Float32Array(63)];
 
 // ---- Static per-frame (letters, numbers) ----
-function processStaticFrame(result, w, h) {
+function processStaticFrame(result, now, w, h) {
   const hand = result.landmarks && result.landmarks[0];
   let clsResult = null;
   if (hand) {
     drawer.drawConnectors(hand, HandLandmarker.HAND_CONNECTIONS,
                           { color: "#ffffff", lineWidth: 2 });
     drawer.drawLandmarks(hand, { color: "#ffd900", radius: 3 });
-    clsResult = classify(flattenHand(hand), w / h);
-    smoother.update(clsResult.prediction);
-    setStatus("");
+    clsResult = classify(flattenHand(hand, staticFlatScratch), w / h);
+    smoother.update(clsResult.prediction, now);
+    setTracking("ready");
   } else {
-    smoother.update(null);
-    setStatus("waiting for hand…");
+    smoother.update(null, now);
+    setTracking("idle");
   }
   const stable = smoother.getStable();
-  if (charBuffer.update(stable)) {
+  if (charBuffer.update(stable, now)) {
     els.strip.textContent = charBuffer.getText();
+    if (speech.letterMode === "letter") speech.speak(stable, { interrupt: true });
+    commitFeedback();
+  }
+  // A pause with no new letter finishes the fingerspelled word (the models
+  // have no "space" sign) — same closing rule the Space button triggers.
+  if (charBuffer.maybeAutoClose(now) !== null) {
+    els.strip.textContent = charBuffer.getText();
+    drainSpelledWords();
   }
   updateHud(stable, clsResult);
 }
@@ -243,33 +395,36 @@ function processWordFrame(result, now, w, h) {
 
   // No hand in frame: mirror the desktop, which clears the word buffer when
   // num_hands == 0 (src/classifier.py:182). Without this the previous sign's
-  // frames linger in wordFrames (up to WORD_BUFFER_FRAMES ~= 2s) and contaminate
+  // frames linger in wordFrames (up to WORD_BUFFER_MS = 1.5s) and contaminate
   // the next sign — the "residue" where a new sign re-predicts the last word.
   // Still step the FSM with null so the cooldown clock advances and the locked
   // word decays, exactly like main.py's word_fsm.step(None, ...) every frame.
   // Shoulders stay cached (they are still there while the hand is off-screen),
   // and pose is skipped entirely — same early-out as the desktop's _empty().
   if (hands.length === 0) {
-    wordFrames = [];
+    recycleWordFrames();
     // Buffer just emptied -> any cached softmax is stale; force a fresh infer
-    // (and cadence restart) when signing resumes.
-    wordInferCounter = 0;
+    // when signing resumes.
     lastWordProbs = null;
     const { word, confidence } = wordFsm.step(null, now / 1000);
-    wordBuffer.tick();
+    wordBuffer.tick(now);
     els.strip.textContent = wordBuffer.getText();
     updateWordHud(word, confidence);
-    setStatus("waiting for hand…");
+    signingUntil = 0; // hands gone -> drop the signing hold immediately
+    setTracking("idle");
     return;
   }
 
-  // Shoulders from pose (body anchor), throttled to every POSE_EVERY_N frames
+  // Shoulders from pose (body anchor), throttled to every POSE_INTERVAL_MS
   // and reusing the last result in between (shoulders barely move). Runs on the
   // off-screen mirrored detection canvas, like the hand detector. Missing pose
   // -> no anchor (position 0), the same graceful degradation as the desktop.
   let shoulderL = lastShoulderL, shoulderR = lastShoulderR;
-  if (poseLandmarker && poseFrameCounter % POSE_EVERY_N === 0) {
+  if (poseLandmarker && now - lastPoseAt >= POSE_INTERVAL_MS) {
+    lastPoseAt = now;
+    const tPose = DEBUG ? performance.now() : 0;
     const pose = poseLandmarker.detectForVideo(detectCanvas, now);
+    if (DEBUG) perfSample("pose", performance.now() - tPose);
     const lm = pose.landmarks && pose.landmarks[0];
     if (lm) {
       shoulderL = [lm[POSE_LEFT_SHOULDER].x, lm[POSE_LEFT_SHOULDER].y];
@@ -280,7 +435,6 @@ function processWordFrame(result, now, w, h) {
     lastShoulderL = shoulderL;
     lastShoulderR = shoulderR;
   }
-  poseFrameCounter++;
   if (shoulderL && shoulderR) drawShoulders(shoulderL, shoulderR, w, h);
 
   // Hands by handedness so the same sign always lands in the same slot
@@ -292,34 +446,59 @@ function processWordFrame(result, now, w, h) {
                           { color: "#ffffff", lineWidth: 2 });
     drawer.drawLandmarks(hands[i], { color: "#ffd900", radius: 3 });
     const side = handed[i] && handed[i][0] && handed[i][0].categoryName;
-    const flat = flattenHand(hands[i]);
+    const flat = flattenHand(hands[i], handFlatScratch[i & 1]);
     if (side === "Left") leftHand = flat;
     else if (side === "Right") rightHand = flat;
   }
 
-  const feat = buildWordFeatures(leftHand, rightHand, shoulderL, shoulderR, aspect);
-  wordFrames.push(feat);
-  if (wordFrames.length > WORD_BUFFER_FRAMES) wordFrames.shift();
+  // Feature row from the recycling pool (buildWordFeatures zero-fills it);
+  // rows age out of the rolling window back into the pool.
+  const tFeat = DEBUG ? performance.now() : 0;
+  const row = wordRowPool.pop() || new Float32Array(WORD_FEATURE_DIM);
+  buildWordFeatures(leftHand, rightHand, shoulderL, shoulderR, aspect, row);
+  wordFrames.push(row);
+  wordFrameTimes.push(now);
+  while (wordFrameTimes.length && wordFrameTimes[0] < now - WORD_BUFFER_MS) {
+    wordRowPool.push(wordFrames.shift());
+    wordFrameTimes.shift();
+  }
+  if (DEBUG) perfSample("feat", performance.now() - tFeat);
 
-  // Classify only once the buffer has filled AND the hands are moving (a still
-  // pose is not a dynamic sign). The FSM still steps every frame with the
-  // resulting prediction (or null) so it can lock/unlock on cooldown.
+  // Classify only once the buffer has filled (enough samples AND enough
+  // wall-clock span — sample count alone would fire early at high fps and
+  // late at low fps) AND the hands are moving (a still pose is not a dynamic
+  // sign). The FSM still steps every frame with the resulting prediction (or
+  // null) so it can lock/unlock on cooldown.
   let wordPred = null;
   let isSigning = false;
-  if (wordFrames.length >= WORD_MIN_FRAMES) {
-    const motion = sequenceMotion(wordFrames, WORD_MOTION_WINDOW);
+  if (wordFrames.length >= WORD_MIN_BUFFER_SAMPLES
+      && now - wordFrameTimes[0] >= WORD_MIN_BUFFER_MS) {
+    // Motion over the last WORD_MOTION_WINDOW_MS of frames (count them from
+    // the newest end — the buffer is time-ordered).
+    let motionCount = 0;
+    const motionCutoff = now - WORD_MOTION_WINDOW_MS;
+    for (let i = wordFrameTimes.length - 1;
+         i >= 0 && wordFrameTimes[i] >= motionCutoff; i--) motionCount++;
+    const motion = sequenceMotion(wordFrames, motionCount);
     isSigning = motion >= WORD_MIN_MOTION_STD;
     if (isSigning) {
-      // Throttle the resample + TCN to every WORD_INFER_EVERY_N signing frames,
-      // reusing the cached softmax in between (see WORD_INFER_EVERY_N above). A
-      // just-reset burst (lastWordProbs === null) always infers fresh first.
+      // Throttle the resample + TCN to every WORD_INFER_INTERVAL_MS while
+      // signing, reusing the cached softmax in between. A just-reset burst
+      // (lastWordProbs === null) always infers fresh first.
       let probs = lastWordProbs;
-      if (probs === null || wordInferCounter % WORD_INFER_EVERY_N === 0) {
+      if (probs === null || now - lastInferAt >= WORD_INFER_INTERVAL_MS) {
+        const tTcn = DEBUG ? performance.now() : 0;
         const seq = resampleSequence(wordFrames, WORD_SEQ_LEN);
-        probs = model.predict(seq);
+        const fresh = model.predict(seq);
+        // predict()'s return is model-owned (overwritten next call); cache a
+        // copy in our own preallocated buffer.
+        if (!wordProbsCopy) wordProbsCopy = new Float32Array(fresh.length);
+        wordProbsCopy.set(fresh);
+        probs = wordProbsCopy;
         lastWordProbs = probs;
+        lastInferAt = now;
+        if (DEBUG) perfSample("tcn", performance.now() - tTcn);
       }
-      wordInferCounter++;
       let idx = 0;
       for (let k = 1; k < probs.length; k++) if (probs[k] > probs[idx]) idx = k;
       const conf = probs[idx];
@@ -329,20 +508,27 @@ function processWordFrame(result, now, w, h) {
         wordPred = { prediction: label, confidence: conf };
       }
     } else {
-      // Gap in signing -> restart the cadence and drop the cached probs so the
-      // next burst re-infers from the current buffer, not a stale one.
-      wordInferCounter = 0;
+      // Gap in signing -> drop the cached probs so the next burst re-infers
+      // from the current buffer, not a stale one.
       lastWordProbs = null;
     }
   }
 
   const { word, confidence, isNew } = wordFsm.step(wordPred, now / 1000);
-  if (isNew) wordBuffer.add(word);
-  wordBuffer.tick();
+  if (isNew) {
+    wordBuffer.add(word, now);
+    // The commit frame — the one moment to speak, log, and flash (mirrors
+    // main.py's new_word_detected block: buffer, then voice, then log).
+    speech.speak(word);
+    conversation.addSign(word);
+    commitFeedback();
+  }
+  wordBuffer.tick(now);
   els.strip.textContent = wordBuffer.getText();
 
   updateWordHud(word, confidence);
-  setStatus(isSigning ? "signing…" : (hands.length ? "" : "waiting for hand…"));
+  if (isSigning) signingUntil = now + SIGNING_HOLD_MS;
+  setTracking(now < signingUntil ? "signing" : "ready");
 }
 
 /** Draw the two shoulder anchors on the (already-mirrored) canvas. */
@@ -417,16 +603,19 @@ function updateDebug() {
     debugEl = document.createElement("div");
     debugEl.id = "perf-debug";
     debugEl.style.cssText =
-      "position:absolute;left:8px;bottom:8px;z-index:5;white-space:pre;"
+      "position:absolute;left:10px;bottom:30px;z-index:5;white-space:pre;"
       + "font:11px/1.4 ui-monospace,Consolas,monospace;color:#9f9;"
       + "background:rgba(0,0,0,.62);padding:5px 8px;border-radius:6px;";
     els.canvas.parentElement.appendChild(debugEl);
   }
   const res = video ? `${video.videoWidth}x${video.videoHeight}` : "?";
+  const ms = (v) => v.toFixed(1).padStart(5);
   debugEl.textContent =
     `mode: ${activeMode.id}\n` +
-    `hand: ${handDelegate}\n` +
-    `pose: ${poseDelegate}\n` +
+    `hand: ${handDelegate}${ms(perfMs.hand)}ms\n` +
+    `pose: ${poseDelegate}${poseDelegate === "GPU" || poseDelegate === "CPU" ? ms(perfMs.pose) + "ms" : ""}\n` +
+    `draw: ${ms(perfMs.draw)}ms  feat:${ms(perfMs.feat)}ms\n` +
+    `tcn:  ${ms(perfMs.tcn)}ms\n` +
     `cam:  ${res}\n` +
     `buf:  ${wordFrames.length}\n` +   // word buffer size (0 with no hand -> no residue)
     `fps:  ${els.fps.textContent || "?"}`;
@@ -440,6 +629,11 @@ function updateDebug() {
 // with an honest message instead of a frozen image.
 let consecutiveErrors = 0;
 const MAX_CONSECUTIVE_ERRORS = 30; // ~1s of solid failures at 30fps
+// The hiccup notice used to be wiped by the per-frame setStatus("") in the
+// process*Frame functions. Those are gone (the live channel is the pill now),
+// so a recovered frame has to clear it explicitly or a single transient error
+// would leave the message parked over the video forever.
+let hiccupShown = false;
 
 function onFrame(now) {
   try {
@@ -451,6 +645,7 @@ function onFrame(now) {
       detectCanvas.width = els.canvas.width = video.videoWidth;
       detectCanvas.height = els.canvas.height = video.videoHeight;
       video.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+      fitStageToAspect(video.videoWidth, video.videoHeight);
     }
 
     const w = detectCanvas.width, h = detectCanvas.height;
@@ -458,6 +653,7 @@ function onFrame(now) {
     // Mirror BEFORE detection (parity with cv2.flip in src/detector.py), onto
     // the OFF-SCREEN canvas. The visible <video> is mirrored by CSS, so what is
     // shown and what is detected match.
+    const tDraw = DEBUG ? performance.now() : 0;
     detectCtx.save();
     detectCtx.scale(-1, 1);
     detectCtx.drawImage(video, -w, 0, w, h);
@@ -465,16 +661,20 @@ function onFrame(now) {
 
     // The overlay canvas only carries the landmarks; clear last frame's.
     ctx.clearRect(0, 0, w, h);
+    if (DEBUG) perfSample("draw", performance.now() - tDraw);
 
+    const tHand = DEBUG ? performance.now() : 0;
     const result = landmarker.detectForVideo(detectCanvas, now);
+    if (DEBUG) perfSample("hand", performance.now() - tHand);
     if (activeMode.kind === "sequence") {
       processWordFrame(result, now, w, h);
     } else {
-      processStaticFrame(result, w, h);
+      processStaticFrame(result, now, w, h);
     }
     updateFps(now);
     if (DEBUG) updateDebug();
     consecutiveErrors = 0;
+    if (hiccupShown) { setStatus(""); hiccupShown = false; }
     framesSeen++;
   } catch (err) {
     consecutiveErrors++;
@@ -484,6 +684,7 @@ function onFrame(now) {
       return; // stop the loop — an honest halt beats an endless error storm
     }
     setStatus("detector hiccup — retrying…", true);
+    hiccupShown = true;
   }
   scheduleNext();
 }
@@ -498,13 +699,21 @@ let framesSeen = 0;
 let useRvfc = false;
 let loopGeneration = 0;
 
+// One callback closure per loop generation (not per frame): scheduling ran
+// 30-60x/second, so a fresh closure each frame was steady GC litter.
+let frameCb = null;
+let frameCbGen = -1;
+
 function scheduleNext() {
-  const gen = loopGeneration;
-  const cb = (now) => { if (gen === loopGeneration) onFrame(now); };
+  if (frameCbGen !== loopGeneration) {
+    const gen = loopGeneration;
+    frameCb = (now) => { if (gen === loopGeneration) onFrame(now); };
+    frameCbGen = gen;
+  }
   if (useRvfc) {
-    video.requestVideoFrameCallback(cb);
+    video.requestVideoFrameCallback(frameCb);
   } else {
-    requestAnimationFrame(cb);
+    requestAnimationFrame(frameCb);
   }
 }
 
@@ -535,6 +744,13 @@ const CAMERA_STORE_KEY = "asl-web.cameraDeviceId";
  * element. The frame loop keeps referencing that same element, so a camera
  * switch never needs to touch the loop. deviceId null = browser default.
  */
+// Phones pay per pixel twice per frame (mirror drawImage + WebGL texture
+// upload); landmark quality is unchanged at the smaller size because the
+// landmarker downscales internally anyway.
+const IS_MOBILE = (navigator.userAgentData && navigator.userAgentData.mobile)
+  || /Android|iPhone|iPad|Mobi/i.test(navigator.userAgent);
+const CAMERA_IDEAL = IS_MOBILE ? CAMERA_IDEAL_MOBILE : CAMERA_IDEAL_DESKTOP;
+
 async function startCamera(deviceId) {
   if (video.srcObject) {
     for (const t of video.srcObject.getTracks()) t.stop();
@@ -542,8 +758,8 @@ async function startCamera(deviceId) {
   const stream = await navigator.mediaDevices.getUserMedia({
     video: {
       ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: "user" }),
-      width: { ideal: 960 },
-      height: { ideal: 540 },
+      width: { ideal: CAMERA_IDEAL.width },
+      height: { ideal: CAMERA_IDEAL.height },
     },
     audio: false,
   });
@@ -556,6 +772,7 @@ async function startCamera(deviceId) {
   detectCanvas.width = els.canvas.width = video.videoWidth;
   detectCanvas.height = els.canvas.height = video.videoHeight;
   video.style.aspectRatio = `${video.videoWidth} / ${video.videoHeight}`;
+  fitStageToAspect(video.videoWidth, video.videoHeight);
 }
 
 function currentCameraId() {
@@ -563,54 +780,133 @@ function currentCameraId() {
   return track ? track.getSettings().deviceId : null;
 }
 
-/** Populate the selector. Hidden unless there is a real choice (2+ cameras). */
+let cameras = [];
+
+/**
+ * Display name for a device. Browsers append the USB vendor:product id
+ * ("HD Pro Webcam C920 (046d:082d)"), which is noise to a user and the reason
+ * the old on-video picker was so wide. Labels only exist once permission is
+ * granted, hence the numbered fallback.
+ */
+function cameraLabel(cam, i) {
+  const raw = (cam.label || "").replace(/\s*\([0-9a-f]{4}:[0-9a-f]{4}\)\s*$/i, "").trim();
+  return raw || `Camera ${i + 1}`;
+}
+
+function closeCamMenu() {
+  els.camMenu.classList.add("hidden");
+  els.camBtn.setAttribute("aria-expanded", "false");
+}
+
+/**
+ * Rebuild both camera controls from the current device list: the bar button
+ * (quick access, next to the video) and the Settings row (where a user goes
+ * looking for a device preference). Both drive selectCamera, so the behaviour
+ * cannot drift between them. Hidden entirely unless there is a real choice.
+ */
 async function refreshCameraList() {
   const devices = await navigator.mediaDevices.enumerateDevices();
-  const cams = devices.filter((d) => d.kind === "videoinput");
-  if (cams.length < 2) {
-    els.cameraSel.classList.add("hidden");
-    return;
-  }
+  cameras = devices.filter((d) => d.kind === "videoinput");
+  const multi = cameras.length >= 2;
+  els.camControl.classList.toggle("hidden", !multi);
+  els.cameraRow.hidden = !multi;
+  if (!multi) return;
+
   const activeId = currentCameraId();
-  els.cameraSel.innerHTML = "";
-  cams.forEach((cam, i) => {
+
+  els.cameraSel.replaceChildren();
+  cameras.forEach((cam, i) => {
     const opt = document.createElement("option");
     opt.value = cam.deviceId;
-    // Labels are only exposed once camera permission is granted; the numbered
-    // fallback covers browsers that still withhold them.
-    opt.textContent = cam.label || `Camera ${i + 1}`;
+    opt.textContent = cameraLabel(cam, i);
     opt.selected = cam.deviceId === activeId;
     els.cameraSel.appendChild(opt);
   });
-  els.cameraSel.classList.remove("hidden");
+
+  // Exactly two cameras is the phone case (front/back), where the only thing
+  // anyone wants is to flip. A menu to choose between two options is a tap of
+  // pure ceremony, so the control collapses to a one-tap toggle instead.
+  const flip = cameras.length === 2;
+  els.camControl.dataset.mode = flip ? "flip" : "menu";
+  closeCamMenu();
+  if (flip) {
+    els.camBtn.title = "Switch camera";
+    els.camBtnLabel.textContent = "Flip";
+    els.camBtn.removeAttribute("aria-haspopup");
+    els.camBtn.removeAttribute("aria-expanded");
+    return;
+  }
+
+  const activeIdx = cameras.findIndex((c) => c.deviceId === activeId);
+  els.camBtn.title = "Choose camera";
+  els.camBtnLabel.textContent =
+    activeIdx >= 0 ? cameraLabel(cameras[activeIdx], activeIdx) : "Camera";
+  els.camBtn.setAttribute("aria-haspopup", "listbox");
+  els.camBtn.setAttribute("aria-expanded", "false");
+  els.camMenu.replaceChildren();
+  cameras.forEach((cam, i) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.setAttribute("role", "option");
+    item.setAttribute("aria-selected", cam.deviceId === activeId ? "true" : "false");
+    item.textContent = cameraLabel(cam, i);
+    item.addEventListener("click", () => {
+      closeCamMenu();
+      selectCamera(cam.deviceId);
+    });
+    els.camMenu.appendChild(item);
+  });
 }
 
-els.cameraSel.addEventListener("change", async () => {
+/** Switch cameras, keeping the app alive if the new device refuses to open. */
+async function selectCamera(newId) {
+  if (!newId || newId === currentCameraId()) return;
   const previousId = currentCameraId();
-  const newId = els.cameraSel.value;
-  els.cameraSel.disabled = true;
+  els.camBtn.disabled = els.cameraSel.disabled = true;
   setStatus("switching camera…");
+  setTracking("busy");
   try {
     await startCamera(newId);
     localStorage.setItem(CAMERA_STORE_KEY, newId);
     // Fresh camera, fresh votes — but the spelled strip is the user's work
     // and survives the switch on purpose.
     smoother.reset();
-    setStatus("waiting for hand…");
+    setStatus("");
   } catch (err) {
     // Demo safety: failing to switch must not leave the app with NO camera.
     // Restore the previous one; only if that also fails, give up honestly.
     console.error("Camera switch failed:", err);
     try {
       await startCamera(previousId);
-      els.cameraSel.value = previousId;
-      setStatus("could not switch camera — kept the previous one", true);
+      // Recoverable: the previous camera is live again, so the notice clears
+      // itself instead of parking over a perfectly working video.
+      flashStatus("could not switch camera — kept the previous one");
     } catch {
       setStatus("Camera unavailable. Reload the page to retry.", true);
     }
   } finally {
-    els.cameraSel.disabled = false;
+    els.camBtn.disabled = els.cameraSel.disabled = false;
+    await refreshCameraList(); // re-sync both controls to whatever is actually live
   }
+}
+
+els.camBtn.addEventListener("click", () => {
+  if (els.camControl.dataset.mode === "flip") {
+    const other = cameras.find((c) => c.deviceId !== currentCameraId());
+    if (other) selectCamera(other.deviceId);
+    return;
+  }
+  const open = els.camMenu.classList.toggle("hidden") === false;
+  els.camBtn.setAttribute("aria-expanded", open ? "true" : "false");
+});
+els.cameraSel.addEventListener("change", () => selectCamera(els.cameraSel.value));
+
+// Dismiss the popover the way every menu is expected to: click away or Escape.
+document.addEventListener("click", (ev) => {
+  if (!els.camControl.contains(ev.target)) closeCamMenu();
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") closeCamMenu();
 });
 
 // ---- Mode loading + switching ----
@@ -665,6 +961,9 @@ async function ensurePose() {
 function applyModeUi(mode) {
   els.heading.textContent = mode.heading;
   els.footer.textContent = mode.footer;
+  // Lets the stylesheet show/hide mode-specific controls (e.g. the Space
+  // button only makes sense while fingerspelling).
+  document.body.dataset.modeKind = mode.kind;
   els.modeBtns.forEach((b) => {
     const on = b.dataset.mode === mode.id;
     b.classList.toggle("active", on);
@@ -677,10 +976,15 @@ async function switchMode(modeId) {
   els.modeBtns.forEach((b) => (b.disabled = true));
   try {
     setStatus(`loading ${MODES[modeId].label.toLowerCase()}…`);
+    setTracking("busy");
     await loadMode(modeId);
     activeMode = MODES[modeId];
     model = modelCache[modeId];
     labels = labelsCache[modeId];
+    // A mode switch is not a discard: close the fingerspelled word in
+    // progress so it reaches the conversation before the strip resets.
+    charBuffer.space();
+    drainSpelledWords();
     // Fresh mode, fresh votes and strip — mirrors main.py resetting the
     // smoother, buffer and word FSM when the desktop app changes mode.
     smoother.reset();
@@ -688,13 +992,15 @@ async function switchMode(modeId) {
     resetWordState();
     els.strip.textContent = "";
     applyModeUi(activeMode);
-    setStatus("waiting for hand…");
+    setStatus(""); // the pill takes over the moment the loop runs a frame
   } catch (err) {
     // A failed switch must not leave the app modeless: activeMode was not
     // reassigned (the load threw first), so we stay on the previous mode.
     console.error("Mode switch failed:", err);
     applyModeUi(activeMode);
-    setStatus(`could not load ${MODES[modeId].label} — kept ${activeMode.label}`, true);
+    // Recoverable — the previous mode is still running behind the notice, so
+    // it clears itself rather than sitting over a working video.
+    flashStatus(`could not load ${MODES[modeId].label} — kept ${activeMode.label}`);
   } finally {
     els.modeBtns.forEach((b) => (b.disabled = false));
   }
@@ -783,7 +1089,8 @@ async function main() {
     await refreshCameraList();
     navigator.mediaDevices.addEventListener("devicechange", refreshCameraList);
 
-    setStatus("waiting for hand…");
+    setStatus(""); // uncover the video; the pill reports tracking from here on
+    setTracking("idle");
     startLoop();
   } catch (err) {
     if (err.name === "NotAllowedError") {
@@ -797,3 +1104,16 @@ async function main() {
 }
 
 main();
+
+// Test hooks, only under ?debug: lets an end-to-end test drive the sign-side
+// commit path (chars -> Space/auto-close -> voice + conversation) without a
+// physical hand in front of the camera.
+if (DEBUG) {
+  window.__signexDebug = {
+    charBuffer,
+    conversation,
+    speech,
+    refreshStrip() { els.strip.textContent = charBuffer.getText(); },
+    drainSpelledWords,
+  };
+}

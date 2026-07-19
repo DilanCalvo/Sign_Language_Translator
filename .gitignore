@@ -43,3 +43,4 @@ internal_project_documentation.txt
 # Stale model backups / evaluation plots are not source — keep them out of git.
 model/*.bak
 model/*.png
+.playwright-cli/

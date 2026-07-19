@@ -1,0 +1,1091 @@
+/* ==========================================================================
+   Signex — caption-console design system.
+
+   Aesthetic direction: a broadcast captioning console. The app's job is to
+   caption a live conversation, so the UI borrows the language of subtitling:
+   deep near-black chrome, caption-yellow accents (the highest-legibility
+   pairing there is), a subtitle bar overlaid on the video, a broadcast-style
+   prediction "bug" in the corner, and a pulsing REC lamp. Two voices in the
+   conversation get two hues: caption yellow for the signer, sky blue for the
+   hearing side — used consistently in chat, borders, and overlays.
+
+   Fonts are vendored (web/vendor/fonts, variable woff2, no CDN at runtime):
+   Inter for UI/display, Google Sans Code (Google's monospace, same family
+   voice as Google Sans) for captions, timestamps and readouts.
+   ========================================================================== */
+
+@font-face {
+  font-family: "Inter";
+  src: url("../vendor/fonts/inter-var-latin.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Google Sans Code";
+  src: url("../vendor/fonts/google-sans-code-var-latin.woff2") format("woff2");
+  font-weight: 300 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ---- Design tokens ---- */
+:root {
+  color-scheme: dark;
+
+  --bg: #0b0d10;
+  --surface-1: #13161b;
+  --surface-2: #1b1f26;
+  --surface-3: #242933;
+  --line: #2a303b;
+  --line-soft: #1f242d;
+
+  --text: #eef0f3;
+  --text-dim: #9aa3b2;
+  --text-faint: #5f6774;
+
+  --accent: #ffd900;        /* captiHon yellow — the signer's voice */
+  --accent-soft: #ffd90022;
+  --accent-ink: #14120a;    /* text on accent */
+  --hearing: #5ab8ff;       /* sky blue — the hearing side's voice */
+  --hearing-soft: #5ab8ff1f;
+
+  --ok: #3ecf5a;
+  --warn: #e6c832;
+  --err: #e05252;
+
+  --radius: 14px;
+  --radius-s: 9px;
+  --radius-pill: 999px;
+
+  --font-ui: "Inter", system-ui, "Segoe UI", sans-serif;
+  --font-mono: "Inter", system-ui, "Segoe UI", sans-serif;
+
+  --shadow-panel: 0 10px 32px rgba(0, 0, 0, 0.45);
+}
+
+* { box-sizing: border-box; margin: 0; }
+
+html { height: 100%; }
+
+body {
+  font-family: var(--font-ui);
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+/* Film-grain wash + a faint top glow: atmosphere without stealing contrast. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
+  opacity: 0.05;
+}
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(120% 60% at 50% -10%, rgba(255, 217, 0, 0.05), transparent 60%);
+}
+
+button {
+  font-family: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.hidden { display: none !important; }
+
+/* ==========================================================================
+   Header
+   ========================================================================== */
+
+#topbar {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 0.8rem clamp(0.9rem, 3vw, 1.6rem);
+  border-bottom: 1px solid var(--line-soft);
+  background: var(--bg)
+}
+
+#brand { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }
+#brand h1 {
+  font-size: 1.15rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+#brand h1 em {
+  font-style: normal;
+  color: var(--accent);
+}
+#heading {
+  font-size: 0.72rem;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#mode-toggle {
+  display: inline-flex;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  padding: 3px;
+  gap: 2px;
+  margin-inline: auto;
+}
+#mode-toggle button {
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 0.38rem 1.1rem;
+  border-radius: var(--radius-pill);
+  transition: background 140ms, color 140ms;
+}
+#mode-toggle button:hover { color: var(--text); }
+#mode-toggle button.active {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+#mode-toggle button:disabled { opacity: 0.5; cursor: default; }
+
+#toolbar { display: flex; gap: 0.4rem; margin-left: auto; }
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.3rem;
+  height: 2.3rem;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  transition: background 140ms, color 140ms, border-color 140ms;
+}
+.icon-btn:hover { background: var(--surface-3); color: var(--text); }
+.icon-btn svg { width: 18px; height: 18px; }
+.icon-btn[aria-pressed="true"] {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: var(--accent-soft);
+}
+/* Muted state: the speaker button shows its slash when voice is off. */
+#tts-btn .slash { display: none; }
+#tts-btn[aria-pressed="false"] .slash { display: block; }
+
+/* ==========================================================================
+   Layout: stage column + conversation rail
+   ========================================================================== */
+
+#layout {
+  position: relative;
+  z-index: 1;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  width: 100%;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1rem clamp(0.9rem, 3vw, 1.6rem) 1.4rem;
+}
+
+#stage-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  min-width: 0;
+}
+
+/* A portrait camera narrows the stage (see fitStageToAspect); --stage-w carries
+   that cap so the bar and the action row stay flush with the video edges
+   instead of spanning a width the video no longer fills. */
+#stage,
+#stage-bar,
+#action-row {
+  width: 100%;
+  max-width: var(--stage-w, none);
+  margin-inline: auto;
+}
+
+/* ---- The stage: video + overlays ---- */
+#stage {
+  position: relative;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: #000;
+  box-shadow: var(--shadow-panel);
+  overflow: hidden;
+}
+/* Broadcast corner framing marks. */
+#stage::before,
+#stage::after {
+  content: "";
+  position: absolute;
+  z-index: 4;
+  width: 16px;
+  height: 16px;
+  pointer-events: none;
+  opacity: 0.55;
+}
+
+#cam {
+  width: 100%;
+  display: block;
+  background: #000;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  transform: scaleX(-1); /* mirror to match mirror-before-detect */
+  z-index: 0;
+}
+#view {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  z-index: 1;
+
+}
+
+#status {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 3;
+  background: rgba(5, 6, 8, 0.72);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(4px);
+  padding: 0.5rem 1rem;
+  border-radius: var(--radius-s);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  text-align: center;
+  max-width: 90%;
+  color: var(--text-dim);
+}
+#status.error { color: #ff8d7e; border-color: #5a2c26; }
+
+#fps {
+  position: absolute;
+  bottom: 8px;
+  left: 10px;
+  z-index: 3;
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  color: var(--text-faint);
+  background: rgba(0, 0, 0, 0.45);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+/* ---- Stage bar: the console strip above the video ----
+   Capture metadata (tracking state, REC lamp, camera picker) belongs here, not
+   over the frame: the video is where the user looks at their own hands, so
+   anything that is not the recognition result would be in the way there. */
+#stage-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.1rem;
+  padding-inline: 0.15rem;
+}
+
+/* The live tracking channel. It is ALWAYS present and only changes colour and
+   label — appearing/disappearing would shift the layout and flicker at frame
+   rate, which is exactly what made the old centred status annoying. */
+#track-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex: none;
+  margin-right: auto;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  background: var(--surface-1);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-pill);
+  padding: 0.3rem 0.75rem;
+  transition: color 200ms, background 200ms, border-color 200ms;
+}
+#track-pill .dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+}
+#track-pill[data-state="ready"] {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--line-soft));
+}
+#track-pill[data-state="signing"] {
+  color: var(--ok);
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  border-color: color-mix(in srgb, var(--ok) 40%, var(--line-soft));
+}
+#track-pill[data-state="signing"] .dot,
+#track-pill[data-state="busy"] .dot {
+  animation: rec-pulse 1s ease-in-out infinite;
+}
+
+/* Camera control: a compact bar button. With exactly two cameras it collapses
+   to a one-tap flip (the phone-camera convention); three or more open a list. */
+/* Shrinkable (min-width:0) so a long device name can never widen the bar past
+   the stage and start the page scrolling sideways. */
+#cam-control { position: relative; flex: 0 1 auto; min-width: 0; }
+.bar-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  max-width: min(12rem, 100%);
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  padding: 0.3rem 0.7rem;
+  transition: background 140ms, color 140ms, border-color 140ms;
+}
+.bar-btn:hover { background: var(--surface-3); color: var(--text); }
+.bar-btn:disabled { opacity: 0.5; cursor: default; }
+.bar-btn svg { width: 14px; height: 14px; flex: none; }
+.bar-btn span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#cam-control[data-mode="menu"] .ic-flip,
+#cam-control[data-mode="flip"] .ic-cam { display: none; }
+#cam-btn[aria-expanded="true"] {
+  background: var(--surface-3);
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+}
+
+#cam-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  min-width: 12rem;
+  max-width: min(78vw, 20rem);
+  padding: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  box-shadow: var(--shadow-panel);
+}
+#cam-menu button {
+  text-align: left;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  padding: 0.45rem 0.6rem;
+  border-radius: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#cam-menu button:hover { background: var(--surface-3); color: var(--text); }
+#cam-menu button[aria-selected="true"] { color: var(--accent); }
+
+#rec-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: #ff6b5e;
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid rgba(255, 107, 94, 0.4);
+  padding: 3px 9px;
+  border-radius: var(--radius-pill);
+}
+#rec-badge .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ff4433;
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+/* Prediction "bug" (top-right of the video, like a broadcast overlay):
+   the big letter/word + its confidence bar. */
+#readout {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+  padding: 0.45rem 0.7rem 0.55rem;
+  background: rgba(5, 6, 8, 0.66);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  backdrop-filter: blur(4px);
+  min-width: 5.2rem;
+  max-width: min(60%, 300px);
+}
+#letter {
+  font-size: clamp(2.2rem, 6vw, 3.4rem);
+  font-weight: 900;
+  line-height: 1;
+  color: #fff;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+#letter.hint {
+  color: var(--text-faint);
+  font-weight: 500;
+  font-size: clamp(1.6rem, 4.5vw, 2.4rem);
+}
+#conf-wrap { width: 100%; min-width: 4.4rem; }
+#conf-track {
+  height: 5px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 3px;
+  overflow: hidden;
+}
+#conf-bar { height: 100%; width: 0; transition: width 120ms; border-radius: 3px; }
+#conf-bar.good { background: var(--ok); }
+#conf-bar.mid  { background: var(--warn); }
+#conf-bar.low  { background: var(--err); }
+#conf-label {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  color: var(--text-dim);
+  margin-top: 3px;
+  text-align: right;
+}
+
+/* Incoming message from the hearing side, shown big over the stage so the
+   signer can read it without leaving the camera. */
+#big-message {
+  position: absolute;
+  top: 12%;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  max-width: min(88%, 640px);
+  padding: 0.7rem 1.1rem;
+  background: rgba(9, 20, 32, 0.85);
+  border: 1px solid color-mix(in srgb, var(--hearing) 55%, transparent);
+  border-left: 4px solid var(--hearing);
+  border-radius: var(--radius-s);
+  backdrop-filter: blur(6px);
+  font-size: clamp(1.15rem, 3.4vw, 1.7rem);
+  font-weight: 700;
+  line-height: 1.25;
+  cursor: pointer;
+  animation: big-message-in 260ms ease both;
+}
+@keyframes big-message-in {
+  from { opacity: 0; transform: translateX(-50%) translateY(-10px); }
+  to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+}
+
+/* The caption bar: the running strip IS a subtitle, overlaid on the video. */
+#strip-bar {
+  position: absolute;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  max-width: 92%;
+  background: rgba(0, 0, 0, 0.78);
+  border-radius: 6px;
+  padding: 0.35rem 0.9rem;
+  transition: opacity 200ms;
+  pointer-events: none;
+  /* rtl container + ltr text clips from the LEFT, so a long sentence always
+     shows its newest words — like a real rolling caption. */
+  overflow: hidden;
+  direction: rtl;
+}
+#strip-bar:has(#strip:empty) { opacity: 0; }
+#strip {
+  direction: ltr;
+  unicode-bidi: plaintext;
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: clamp(1.05rem, 3vw, 1.45rem);
+  letter-spacing: 0.12em;
+  color: var(--accent);
+  white-space: nowrap;
+  text-align: center;
+}
+
+/* Commit feedback: one confident pulse of the stage ring when a sign lands. */
+#stage.commit-flash {
+  animation: commit-ring 340ms ease-out;
+}
+@keyframes commit-ring {
+  0%   { box-shadow: 0 0 0 0 rgba(255, 217, 0, 0.75), var(--shadow-panel); }
+  100% { box-shadow: 0 0 0 14px rgba(255, 217, 0, 0), var(--shadow-panel); }
+}
+
+/* ---- Below the stage ---- */
+
+#alternatives {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  background: var(--surface-1);
+  border: 1px solid var(--line-soft);
+  padding: 0.45rem 0.9rem;
+  border-radius: var(--radius-s);
+  width: fit-content;
+}
+#alternatives::before {
+  content: "unsure — top 3:";
+  color: var(--text-faint);
+}
+#alternatives span { color: var(--text); }
+
+#action-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.6rem;
+}
+/* Space: drawn as a keycap — it does what the spacebar would. */
+#space-btn {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-bottom-width: 3px;
+  border-radius: var(--radius-s);
+  padding: 0.5rem 2.2rem 0.45rem;
+  transition: background 120ms, color 120ms, transform 60ms;
+}
+#space-btn:hover { background: var(--surface-3); color: var(--text); }
+#space-btn:active { transform: translateY(1px); border-bottom-width: 2px; }
+#clear {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-bottom-width: 3px;
+  border-radius: var(--radius-s);
+  padding: 0.5rem 2.2rem 0.45rem;
+  transition: background 120ms, color 120ms, transform 60ms;
+}
+#clear:hover { color: var(--err); border-color: color-mix(in srgb, var(--err) 50%, var(--line)); }
+
+/* Word mode has no fingerspelling word-close. */
+body[data-mode-kind="sequence"] .static-only { display: none; }
+
+#footer {
+  font-size: 0.72rem;
+  color: var(--text-faint);
+  line-height: 1.5;
+  max-width: 60ch;
+}
+
+/* ==========================================================================
+   Conversation rail
+   ========================================================================== */
+
+#chat-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--surface-1);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+#chat-header {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--line-soft);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent);
+}
+#chat-header .chat-title {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  margin-right: auto;
+}
+
+.chip-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  padding: 0.3rem 0.7rem;
+  transition: background 140ms, color 140ms, border-color 140ms;
+}
+.chip-btn:hover { background: var(--surface-3); color: var(--text); }
+.chip-btn svg { width: 13px; height: 13px; }
+.chip-btn:disabled { opacity: 0.45; cursor: default; }
+.chip-btn:disabled:hover { background: var(--surface-2); color: var(--text-dim); }
+
+#rec-btn .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.7;
+}
+#rec-btn[aria-pressed="true"] {
+  color: #ff6b5e;
+  border-color: rgba(255, 107, 94, 0.5);
+  background: rgba(255, 68, 51, 0.1);
+}
+#rec-btn[aria-pressed="true"] .dot {
+  background: #ff4433;
+  opacity: 1;
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+
+#chat-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.8rem 0.75rem;
+  scroll-behavior: smooth;
+  overscroll-behavior: contain;
+}
+#chat-empty {
+  margin: auto;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 0.78rem;
+  line-height: 1.6;
+  max-width: 24ch;
+}
+#chat-empty strong { color: var(--text-dim); font-weight: 700; }
+
+.msg {
+  max-width: 88%;
+  padding: 0.45rem 0.7rem 0.5rem;
+  border-radius: var(--radius-s);
+  background: var(--surface-2);
+  border: 1px solid var(--line-soft);
+  animation: msg-in 200ms ease both;
+}
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.msg .meta {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.15rem;
+}
+.msg .who {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.msg time {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: var(--text-faint);
+}
+.msg .text {
+  font-size: 0.92rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.msg.sign {
+  align-self: flex-start;
+  border-left: 3px solid var(--accent);
+}
+.msg.sign .who { color: var(--accent); }
+.msg.sign .text { font-family: var(--font-mono); letter-spacing: 0.04em; }
+.msg.hearing {
+  align-self: flex-end;
+  border-right: 3px solid var(--hearing);
+}
+.msg.hearing .who { color: var(--hearing); }
+/* While recording, unrecorded context stays visually distinct? No — recorded
+   entries get the tape mark instead. */
+.msg .tape {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  color: #ff6b5e;
+  margin-left: auto;
+}
+
+#compose-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.6rem 0.7rem;
+  border-top: 1px solid var(--line-soft);
+  background: var(--surface-1);
+}
+#compose-input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-ui);
+  font-size: 0.95rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  padding: 0.55rem 1rem;
+  transition: border-color 140ms;
+}
+#compose-input::placeholder { color: var(--text-faint); }
+#compose-input:focus { border-color: color-mix(in srgb, var(--hearing) 55%, var(--line)); outline: none; }
+#stt-btn.listening {
+  color: var(--hearing);
+  border-color: color-mix(in srgb, var(--hearing) 55%, var(--line));
+  background: var(--hearing-soft);
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+#send-btn {
+  background: var(--hearing);
+  color: #06131f;
+  border-color: transparent;
+}
+#send-btn:hover { background: #7cc7ff; color: #06131f; }
+
+/* ==========================================================================
+   Dialogs (help + settings)
+   ========================================================================== */
+
+dialog {
+  margin: auto;
+  width: min(92vw, 560px);
+  max-height: 86vh;
+  background: var(--surface-1);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0;
+  box-shadow: var(--shadow-panel);
+}
+dialog::backdrop {
+  background: rgba(4, 5, 7, 0.65);
+  backdrop-filter: blur(3px);
+}
+.dialog-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.9rem 1.1rem;
+  border-bottom: 1px solid var(--line-soft);
+}
+.dialog-head h2 {
+  font-size: 0.95rem;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.dialog-head h2 em { font-style: normal; color: var(--accent); }
+.dialog-close {
+  margin-left: auto;
+  width: 2rem;
+  height: 2rem;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-dim);
+  font-size: 1rem;
+  line-height: 1;
+}
+.dialog-close:hover { background: var(--surface-3); color: var(--text); }
+.dialog-body {
+  padding: 1rem 1.1rem 1.2rem;
+  overflow-y: auto;
+  max-height: calc(86vh - 3.4rem);
+  font-size: 0.88rem;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+.dialog-body h3 {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 1.1rem 0 0.4rem;
+}
+.dialog-body h3:first-child { margin-top: 0; }
+.dialog-body ul { padding-left: 1.1rem; }
+.dialog-body li { margin: 0.25rem 0; }
+.dialog-body strong { color: var(--text); }
+.dialog-body kbd {
+  font-family: var(--font-mono);
+  font-size: 0.78em;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 0.05em 0.4em;
+}
+
+/* Settings controls */
+.setting-row {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.7rem 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.setting-row:last-child { border-bottom: none; }
+.setting-label { flex: 1; min-width: 0; }
+.setting-label .name { color: var(--text); font-weight: 700; font-size: 0.9rem; }
+.setting-label .desc { font-size: 0.75rem; color: var(--text-faint); margin-top: 0.1rem; }
+
+.switch { position: relative; display: inline-block; flex: none; }
+.switch input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.switch .track {
+  display: block;
+  width: 42px;
+  height: 24px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+  transition: background 160ms, border-color 160ms;
+}
+.switch .track::after {
+  content: "";
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: transform 160ms, background 160ms;
+}
+.switch input:checked + .track {
+  background: color-mix(in srgb, var(--accent) 30%, var(--surface-3));
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+}
+.switch input:checked + .track::after {
+  transform: translateX(18px);
+  background: var(--accent);
+}
+.switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.select {
+  font-family: var(--font-ui);
+  font-size: 0.85rem;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  padding: 0.45rem 0.6rem;
+  max-width: 15rem;
+}
+
+.radio-group { display: flex; gap: 0.4rem; flex: none; }
+.radio-group label {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--text-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  padding: 0.3rem 0.8rem;
+  cursor: pointer;
+  transition: background 140ms, color 140ms, border-color 140ms;
+}
+.radio-group input { position: absolute; opacity: 0; pointer-events: none; }
+.radio-group input:checked + span { color: var(--accent-ink); }
+.radio-group label:has(input:checked) {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+/* ==========================================================================
+   Load-in choreography
+   ========================================================================== */
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+#topbar    { animation: rise 420ms ease both; }
+#stage-col { animation: rise 420ms 70ms ease both; }
+#chat-col  { animation: rise 420ms 140ms ease both; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ==========================================================================
+   Responsive: mobile-first column; two-pane console from 900px up
+   ========================================================================== */
+
+/* Dialogs become bottom sheets on a phone: a centred box with a wide control
+   inside has nowhere to go on a 390px screen, and a sheet puts the content in
+   the thumb's reach. */
+@media (max-width: 560px) {
+  dialog {
+    width: 100%;
+    max-width: none;
+    max-height: 88vh;
+    margin: auto auto 0;
+    border-radius: var(--radius) var(--radius) 0 0;
+    border-bottom: none;
+    animation: sheet-in 240ms cubic-bezier(0.2, 0.9, 0.3, 1) both;
+  }
+  .dialog-body { max-height: calc(88vh - 3.4rem); }
+
+  /* Stack label over control. A flex row cannot survive here: a <select> has a
+     large intrinsic width, so it starved the label down to ~60px and wrapped
+     "Voices come from this device." into four lines. */
+  .setting-row:not(.inline) {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.55rem;
+  }
+  .setting-row:not(.inline) .select {
+    width: 100%;
+    max-width: none;
+  }
+  .setting-row:not(.inline) .radio-group { width: 100%; }
+  .setting-row:not(.inline) .radio-group label {
+    flex: 1;
+    text-align: center;
+  }
+}
+@keyframes sheet-in {
+  from { transform: translateY(14px); opacity: 0; }
+  to   { transform: translateY(0); opacity: 1; }
+}
+
+/* Touch targets: the 2.3rem icon buttons are 36.8px, under the 44px guideline.
+   Only coarse pointers pay the extra size — the mouse layout stays compact. */
+@media (pointer: coarse) {
+  .icon-btn { width: 2.75rem; height: 2.75rem; }
+  .chip-btn,
+  .bar-btn { min-height: 2.25rem; }
+  .select { min-height: 2.75rem; }
+  .radio-group label {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 2.75rem;
+  }
+  #cam-menu button {
+    display: flex;
+    align-items: center;
+    min-height: 2.75rem;
+  }
+}
+
+/* Narrow phones: the camera button drops its label and goes icon-only. The
+   label is the least load-bearing thing in the bar — the flip icon and the
+   popover both still say what the control does — and dropping it keeps the
+   tracking pill and the REC lamp readable on a 320px screen. */
+@media (max-width: 460px) {
+  .bar-btn { padding-inline: 0.55rem; }
+  .bar-btn span { display: none; }
+  .chat-title{ display: none;}
+  #chat-header {display: flex; justify-content: space-evenly;}
+}
+
+@media (max-width: 899.5px) {
+  #brand { order: 1; }
+  #toolbar { order: 2; }
+  #mode-toggle {
+    order: 3;
+    width: 100%;
+    justify-content: center;
+  }
+  #mode-toggle button { flex: 1; text-align: center; }
+
+  /* The conversation rail stacks under the stage; the compose bar sticks to
+     the bottom of the viewport (thumb zone) while the page scrolls. */
+  #chat-list { max-height: 44vh; }
+  #compose-bar {
+    position: sticky;
+    bottom: 0;
+    z-index: 6;
+    box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.45);
+  }
+}
+
+@media (min-width: 900px) {
+  #layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 350px;
+    align-items: start;
+  }
+  #chat-col {
+    position: sticky;
+    top: 1rem;
+    height: calc(100vh - 2rem - 61px); /* viewport minus header + padding */
+    min-height: 420px;
+  }
+}

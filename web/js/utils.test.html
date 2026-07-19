@@ -21,10 +21,11 @@
 <div id="summary">running…</div>
 
 <script type="module">
-import { normalizeLandmarks, PredictionSmoother, CharBuffer,
+import { normalizeLandmarks, TimeSmoother, CharBuffer, WordBuffer,
          wordFeaturesFromRaw, resampleSequence } from "./utils.js";
 import { loadDenseModel, loadWordModel } from "./model.js";
 import { WORD_SEQ_LEN } from "./config.js";
+import { formatStamp, formatTxt, formatCsv } from "./conversation.js";
 
 // Both static modes run through the same JS engine; the gate covers both ports
 // so a numbers-only (or letters-only) regression can't slip through.
@@ -150,41 +151,163 @@ for (const m of MODE_FIXTURES) {
   }
 }
 
-// ---- 3. PredictionSmoother behavior (mirrors Python semantics) ----
+// ---- 3. TimeSmoother behavior (time-based web divergence, fake clock) ----
+// All timestamps are fabricated ms — the class never reads a real clock, so
+// these are fully deterministic. "30fps" = 33.3ms spacing, "60fps" = 16.7ms,
+// "15fps" = 66.7ms.
 {
-  const ul = section("PredictionSmoother — behavioral");
-  let s = new PredictionSmoother(7, 5);
-  ["A","A","A","A","A"].forEach((p) => s.update(p));
-  report(ul, "5xA in window of 7 -> stable A", s.getStable() === "A");
+  const ul = section("TimeSmoother — behavioral (fake clock)");
+  const W = 233, FRAC = 5 / 7, MIN = 3;
 
-  s = new PredictionSmoother(7, 5);
-  ["A","A","A","A",null,null,null].forEach((p) => s.update(p));
-  report(ul, "4xA + 3xnull -> null (nulls count against)", s.getStable() === null);
+  // 30fps: 7 samples fit the window; need ceil(5/7*7)=5 votes — the original
+  // desktop 5-of-7 behavior reproduced exactly at the baseline rate.
+  let s = new TimeSmoother(W, FRAC, MIN);
+  for (let i = 0; i < 7; i++) s.update(i < 5 ? "A" : "B", i * 33.3);
+  report(ul, "30fps: 5xA + 2xB in window -> stable A", s.getStable() === "A");
 
-  s = new PredictionSmoother(7, 5);
-  ["A","A","A","A","A","B","B","B"].forEach((p) => s.update(p));
-  // window keeps last 7: A A A A B B B -> A has 4 votes < 5
-  report(ul, "letter change flushes old votes", s.getStable() === null);
+  s = new TimeSmoother(W, FRAC, MIN);
+  for (let i = 0; i < 7; i++) s.update(i < 4 ? "A" : null, i * 33.3);
+  report(ul, "30fps: 4xA + 3xnull -> null (nulls count against)", s.getStable() === null);
 
-  s = new PredictionSmoother(7, 5);
+  // 60fps: ~14 samples fit; 9 votes < ceil(5/7*14)=10 -> not stable yet, and
+  // 10 votes -> stable (same ~170ms of real-time agreement as at 30fps).
+  s = new TimeSmoother(W, FRAC, MIN);
+  for (let i = 0; i < 14; i++) s.update(i < 9 ? "A" : "B", i * 16.7);
+  report(ul, "60fps: 9 of 14 votes -> not stable (needs 10)", s.getStable() === null);
+  s = new TimeSmoother(W, FRAC, MIN);
+  for (let i = 0; i < 14; i++) s.update(i < 10 ? "A" : "B", i * 16.7);
+  report(ul, "60fps: 10 of 14 votes -> stable A", s.getStable() === "A");
+
+  // Eviction: samples older than the window fall out and stop counting.
+  s = new TimeSmoother(W, FRAC, MIN);
+  for (let i = 0; i < 5; i++) s.update("A", i * 33.3);
+  for (let i = 0; i < 3; i++) s.update("B", 400 + i * 33.3); // A's now aged out
+  report(ul, "old votes age out of the window", s.getStable() === "B");
+
+  // minSamples floor: fewer than 3 samples can never be stable, even unanimous.
+  s = new TimeSmoother(W, FRAC, MIN);
+  s.update("A", 0); s.update("A", 66.7);
+  report(ul, "15fps: 2 unanimous samples < minSamples floor -> null", s.getStable() === null);
+  s.update("A", 133.3);
+  report(ul, "15fps: 3rd unanimous sample meets the floor -> stable A", s.getStable() === "A");
+
+  s = new TimeSmoother(W, FRAC, MIN);
   report(ul, "empty buffer -> null", s.getStable() === null);
-  s.update("A"); s.reset();
+  s.update("A", 0); s.reset();
   report(ul, "reset clears buffer", s.getStable() === null);
 }
 
-// ---- 4. CharBuffer behavior (mirrors src/overlay.py::LetterBuffer) ----
+// ---- 4. CharBuffer behavior (time-based + word close, fake clock) ----
 {
-  const ul = section("CharBuffer — behavioral");
-  const b = new CharBuffer(3);
-  const accepted1 = b.update("a");
-  const accepted2 = b.update("B"); // still cooling down
+  const ul = section("CharBuffer — behavioral (fake clock)");
+  const b = new CharBuffer(667, 2000, 10); // cooldownMs, wordCloseMs, maxChars
+  const accepted1 = b.update("a", 1000);
+  const accepted2 = b.update("B", 1300); // still cooling down (until 1667)
   report(ul, "first letter accepted, uppercased", accepted1 && b.getText() === "A");
   report(ul, "second letter rejected during cooldown", !accepted2);
-  b.update(null); b.update(null); // cooldown ticks down
-  const accepted3 = b.update("B");
+  report(ul, "null never accepted", !b.update(null, 5000));
+  const accepted3 = b.update("B", 1700); // past the 667ms deadline
   report(ul, "letter accepted after cooldown", accepted3 && b.getText() === "AB");
+
+  // Auto-close: no letter for wordCloseMs finishes the word.
+  report(ul, "no auto-close before the pause", b.maybeAutoClose(3699) === null);
+  const closed = b.maybeAutoClose(3700); // 1700 + 2000
+  report(ul, "auto-close after pause returns the word", closed === "AB");
+  report(ul, "closed word queued for drain", b.popCompletedWords().join(",") === "AB");
+  report(ul, "drain empties the queue", b.popCompletedWords().length === 0);
+  report(ul, "close appended the space", b.getText() === "AB ");
+  report(ul, "no re-close while idle (word already closed)", b.maybeAutoClose(9999) === null);
+
+  // Manual close via the Space button.
+  b.update("C", 4000);
+  const spaceWord = b.space();
+  report(ul, "space() closes the in-progress word", spaceWord === "C" && b.getText() === "AB C ");
+  report(ul, "space() on a fresh boundary adds nothing", b.space() === null && b.getText() === "AB C ");
+  const afterSpace = b.update("D", 4001); // space() lifted the cooldown
+  report(ul, "space() resets the cooldown", afterSpace);
+
+  // Cap: only the newest maxChars (10) chars are kept.
+  const c = new CharBuffer(0, 2000, 10);
+  for (let i = 0; i < 15; i++) c.update("X", i * 10);
+  report(ul, "char cap trims from the front", c.getText(28) === "XXXXXXXXXX");
+
   b.clear();
-  report(ul, "clear empties strip", b.getText() === "");
+  report(ul, "clear empties strip", b.getText() === "" && b.popCompletedWords().length === 0);
+}
+
+// ---- 4b. WordBuffer behavior (time-based pause auto-clear, fake clock) ----
+{
+  const ul = section("WordBuffer — behavioral (fake clock)");
+  const wb = new WordBuffer(5000);
+  wb.add("HELLO", 1000);
+  wb.add("YOU", 2000);
+  report(ul, "signs accumulate", wb.getText() === "HELLO YOU");
+  wb.tick(6999); // 4999ms after the last add
+  report(ul, "sentence survives just under the pause", wb.getText() === "HELLO YOU");
+  wb.tick(7000); // 5000ms after the last add
+  report(ul, "sentence auto-clears after the pause", wb.getText() === "");
+  report(ul, "add(null) ignored", wb.add(null, 8000) === null && wb.getText() === "");
+}
+
+// ---- 4c. Model buffer-reuse contract ----
+// predict() returns a model-owned buffer, valid only until the next call.
+// Verifies: (a) two different inputs produce different results in sequence
+// (both matching their fixtures — covered by sections 2/2d), and (b) a COPY
+// of the first result is NOT silently mutated into the second (the aliasing
+// bug the copy-at-cache in pipeline.js guards against).
+{
+  const ul = section("Model — reused output buffer contract");
+  try {
+    const model = await loadDenseModel(MODE_FIXTURES[0].model);
+    const cases = await (await fetch(MODE_FIXTURES[0].modelFx)).json();
+    if (cases.length >= 2) {
+      const p1 = model.predict(Float32Array.from(cases[0].input));
+      const copy1 = Float32Array.from(p1);
+      const p2 = model.predict(Float32Array.from(cases[1].input));
+      report(ul, "second predict overwrites the shared buffer", p1 === p2);
+      report(ul, "copy taken before the second predict is preserved",
+             maxAbsDiff(copy1, cases[0].expected_probs) < 1e-4);
+      report(ul, "results still differ across inputs (no stale reuse)",
+             maxAbsDiff(copy1, p2) > 1e-3);
+    } else {
+      report(ul, "need 2+ fixture cases", false);
+    }
+  } catch (e) {
+    report(ul, "buffer-reuse check", false, e.message);
+  }
+}
+
+// ---- 5. Conversation export formatters (byte parity with the desktop's
+// src/conversation_log.py export files) ----
+{
+  const ul = section("Conversation export — TXT/CSV format parity");
+  const entries = [
+    { when: new Date(2026, 6, 18, 14, 30, 5), source: "Senas", text: "HELLO YOU" },
+    { when: new Date(2026, 6, 18, 14, 30, 12), source: "Oyente", text: "hola, como estas" },
+    { when: new Date(2026, 6, 18, 14, 31, 0), source: "Oyente", text: 'she said "hi"' },
+  ];
+
+  report(ul, "stamp format YYYYMMDD_HHMMSS",
+         formatStamp(new Date(2026, 6, 18, 14, 30, 5)) === "20260718_143005");
+
+  const txt = formatTxt(entries, "20260718_143005");
+  const expectedTxt =
+    "Conversation log - 20260718_143005\n" +
+    "========================================\n" +
+    "\n" +
+    "[14:30:05] Senas: HELLO YOU\n" +
+    "[14:30:12] Oyente: hola, como estas\n" +
+    '[14:31:00] Oyente: she said "hi"\n';
+  report(ul, "TXT layout matches the desktop export", txt === expectedTxt);
+
+  const csv = formatCsv(entries);
+  const expectedCsv =
+    "timestamp,source,text\r\n" +
+    "2026-07-18T14:30:05,Senas,HELLO YOU\r\n" +
+    '2026-07-18T14:30:12,Oyente,"hola, como estas"\r\n' +
+    '2026-07-18T14:31:00,Oyente,"she said ""hi"""\r\n';
+  report(ul, "CSV rows match (ISO seconds, minimal quoting, doubled quotes)",
+         csv === expectedCsv);
 }
 
 const s = document.getElementById("summary");

@@ -22,7 +22,12 @@ const MIDDLE_MCP = 9;  // base of the middle finger (scale reference)
  *   3. scale by the wrist -> middle-MCP distance (guard: < 1e-6 -> 1.0)
  * `aspect` undefined/null skips step 1 (legacy behavior).
  */
-export function normalizeLandmarks(flat, aspect) {
+// Scratch for the un-stretch step: the per-frame path calls this dozens of
+// times per second, so the intermediate must not allocate. Only valid within
+// one call (never returned, never stored).
+const _normSrcScratch = new Float32Array(63);
+
+export function normalizeLandmarks(flat, aspect, out) {
   if (flat.length !== 63) {
     throw new Error(`Expected 63 values, got ${flat.length}`);
   }
@@ -30,88 +35,159 @@ export function normalizeLandmarks(flat, aspect) {
   if (aspect !== undefined && aspect !== null) {
     // Float32Array mirrors Python's float32 rounding after the division,
     // keeping the parity fixtures within tolerance.
-    src = new Float32Array(63);
+    src = _normSrcScratch;
     for (let i = 0; i < 21; i++) {
       src[i * 3] = flat[i * 3];
       src[i * 3 + 1] = flat[i * 3 + 1] / aspect;
       src[i * 3 + 2] = flat[i * 3 + 2];
     }
   }
-  const out = new Float32Array(63);
+  // `out` (optional) lets the hot path reuse a destination buffer; omitted,
+  // behavior is identical to the original allocate-and-return.
+  const dst = out || new Float32Array(63);
   const wx = src[WRIST * 3], wy = src[WRIST * 3 + 1], wz = src[WRIST * 3 + 2];
   for (let i = 0; i < 21; i++) {
-    out[i * 3] = src[i * 3] - wx;
-    out[i * 3 + 1] = src[i * 3 + 1] - wy;
-    out[i * 3 + 2] = src[i * 3 + 2] - wz;
+    dst[i * 3] = src[i * 3] - wx;
+    dst[i * 3 + 1] = src[i * 3 + 1] - wy;
+    dst[i * 3 + 2] = src[i * 3 + 2] - wz;
   }
   let scale = Math.hypot(
-    out[MIDDLE_MCP * 3], out[MIDDLE_MCP * 3 + 1], out[MIDDLE_MCP * 3 + 2],
+    dst[MIDDLE_MCP * 3], dst[MIDDLE_MCP * 3 + 1], dst[MIDDLE_MCP * 3 + 2],
   );
   if (scale < 1e-6) scale = 1.0;
-  for (let i = 0; i < 63; i++) out[i] /= scale;
-  return out;
+  for (let i = 0; i < 63; i++) dst[i] /= scale;
+  return dst;
 }
 
 /**
- * Sliding-window vote filter. Port of src/utils.py::PredictionSmoother.
- * null predictions count AGAINST stability on purpose: if the hand leaves
- * the frame the system waits for fresh consensus.
+ * Sliding-window vote filter over TIME, not frames (deliberate web divergence
+ * from src/utils.py::PredictionSmoother, 2026-07-19: frame counts made slow
+ * devices wait proportionally longer in wall-clock time). Semantics preserved:
+ * null predictions count AGAINST stability on purpose — if the hand leaves the
+ * frame the system waits for fresh consensus.
+ *
+ * The vote requirement is a FRACTION of however many samples landed inside the
+ * window (5-of-7 at 30fps, 10-of-14 at 60fps: the same ~170ms of agreement),
+ * with an absolute floor so one or two stray frames can never look "stable".
+ * `nowMs` is an explicit parameter (the frame timestamp) so tests are
+ * deterministic and the class never reads a clock.
  */
-export class PredictionSmoother {
-  constructor(window = 7, minVotes = 5) {
-    this._buffer = [];
-    this._window = window;
-    this._minVotes = minVotes;
+export class TimeSmoother {
+  constructor(windowMs, minFraction, minSamples) {
+    this._window = windowMs;
+    this._minFraction = minFraction;
+    this._minSamples = minSamples;
+    this._buf = [];            // { p: prediction|null, t: ms }
+    this._counts = new Map();  // reused across calls — no per-frame allocation
   }
 
-  update(prediction) {
-    this._buffer.push(prediction);
-    if (this._buffer.length > this._window) this._buffer.shift();
+  update(prediction, nowMs) {
+    this._buf.push({ p: prediction, t: nowMs });
+    const cutoff = nowMs - this._window;
+    while (this._buf.length && this._buf[0].t <= cutoff) this._buf.shift();
   }
 
   getStable() {
-    const valid = this._buffer.filter((p) => p !== null && p !== undefined);
-    if (valid.length === 0) return null;
-    const counts = new Map();
+    const n = this._buf.length;
+    if (n < this._minSamples) return null;
+    // The tiny epsilon keeps float error in fraction*n (e.g. 5/7 * 7) from
+    // ever ceiling one vote above the intended integer.
+    const need = Math.max(this._minSamples, Math.ceil(this._minFraction * n - 1e-9));
+    this._counts.clear();
     let top = null, topCount = 0;
-    for (const p of valid) {
-      const n = (counts.get(p) || 0) + 1;
-      counts.set(p, n);
-      if (n > topCount) { top = p; topCount = n; }
+    for (const e of this._buf) {
+      if (e.p === null || e.p === undefined) continue;
+      const c = (this._counts.get(e.p) || 0) + 1;
+      this._counts.set(e.p, c);
+      if (c > topCount) { top = e.p; topCount = c; }
     }
-    return topCount >= this._minVotes ? top : null;
+    return topCount >= need ? top : null;
   }
 
   reset() {
-    this._buffer.length = 0;
+    this._buf.length = 0;
   }
 }
 
 /**
- * Accumulated-characters strip. Port of src/overlay.py::LetterBuffer, minus
- * del/space handling: the static models (letters A-Y no J/Z, digits 0-9) have
- * no del/space classes, so the web UI uses a clear button instead. Shared by
- * letters and numbers modes — it just collects whatever stable character the
- * active model emits. Same cadence rule: once a character is accepted, nothing
- * else is accepted until cooldownFrames pass (a held pose repeats every
- * ~0.67s, not per frame).
+ * Accumulated-characters strip for the static modes (letters, numbers), with
+ * the desktop's word-close behavior (src/overlay.py::LetterBuffer): the models
+ * have no del/space classes, so a fingerspelled word ends via the Space button
+ * (`space()`) or a pause with no new letter (`maybeAutoClose()`). Closed words
+ * queue in `_completed` for the caller to drain (`popCompletedWords()`) into
+ * voice/log — same decoupling as the desktop.
+ *
+ * Time-based (web divergence, 2026-07-19): the accept cooldown is a ms
+ * deadline, not a frame countdown, so a held pose repeats at the same
+ * real-time pace on every device. `_chars` is capped (old chars drop off the
+ * front) — unbounded growth was a slow session-long leak.
  */
 export class CharBuffer {
-  constructor(cooldownFrames) {
+  constructor(cooldownMs, wordCloseMs, maxChars) {
+    this._cooldownMs = cooldownMs;
+    this._wordCloseMs = wordCloseMs;
+    this._maxChars = maxChars;
     this._chars = [];
-    this._cooldown = 0;
-    this._cooldownFrames = cooldownFrames;
+    this._completed = [];
+    this._readyAt = 0;         // next accept allowed at (ms)
+    this._lastAcceptAt = null; // ms of last accepted char; null = no open word
   }
 
   /** Offer the current stable character (or null). True if accepted this frame. */
-  update(ch) {
-    if (this._cooldown > 0) this._cooldown--;
-    if (ch === null || ch === undefined || this._cooldown > 0) {
+  update(ch, nowMs) {
+    if (ch === null || ch === undefined || nowMs < this._readyAt) {
       return false;
     }
     this._chars.push(ch.toUpperCase());
-    this._cooldown = this._cooldownFrames;
+    if (this._chars.length > this._maxChars) {
+      this._chars.splice(0, this._chars.length - this._maxChars);
+    }
+    this._readyAt = nowMs + this._cooldownMs;
+    this._lastAcceptAt = nowMs;
     return true;
+  }
+
+  /** Manual word close (Space button). Returns the closed word, or null. */
+  space() {
+    const word = this._closeWord();
+    // A deliberate user action must not be swallowed by the letter cooldown.
+    this._readyAt = 0;
+    this._lastAcceptAt = null;
+    return word;
+  }
+
+  /**
+   * Auto-close on inactivity: once no letter has been accepted for
+   * wordCloseMs, the in-progress word is finished. Call every frame; returns
+   * the closed word on the closing frame, else null.
+   */
+  maybeAutoClose(nowMs) {
+    if (this._lastAcceptAt === null) return null;
+    if (nowMs - this._lastAcceptAt < this._wordCloseMs) return null;
+    const word = this._closeWord();
+    this._lastAcceptAt = null;
+    return word;
+  }
+
+  /** Extract the trailing word, queue it, append the separating space. */
+  _closeWord() {
+    if (this._chars.length === 0 || this._chars[this._chars.length - 1] === " ") {
+      return null;
+    }
+    const text = this._chars.join("").replace(/\s+$/, "");
+    const parts = text.split(/\s+/);
+    const word = parts[parts.length - 1] || null;
+    if (word) this._completed.push(word);
+    this._chars.push(" ");
+    return word;
+  }
+
+  /** Drain finished words (for voice/log) — decouples buffer from consumers. */
+  popCompletedWords() {
+    if (this._completed.length === 0) return this._completed;
+    const done = this._completed;
+    this._completed = [];
+    return done;
   }
 
   getText(maxChars = 28) {
@@ -120,7 +196,9 @@ export class CharBuffer {
 
   clear() {
     this._chars.length = 0;
-    this._cooldown = 0;
+    this._completed.length = 0;
+    this._readyAt = 0;
+    this._lastAcceptAt = null;
   }
 }
 
@@ -135,32 +213,38 @@ export const WORD_FEATURE_LEN = 130;    // src.utils.WORD_FEATURE_LEN
 export const WORD_RAW_FRAME_LEN = 131;  // src.utils.WORD_RAW_FRAME_LEN
 const _HAND_BLOCK_LEN = 65;             // 63 shape + 2 body-relative wrist pos
 
+// Scratch for one normalized handshape while filling a feature row (valid only
+// within _handBlockInto; distinct from normalizeLandmarks' own src scratch).
+const _handNormScratch = new Float32Array(63);
+
 /**
- * One hand's 65-value block. Port of src/utils.py::_hand_block.
- * `handFlat` is a 63-value raw landmark array or null; `frame` is
- * [cx, cy, scale] in width units or null (no body anchor); `aspect` un-stretches.
- * Missing hand -> zeros; no body frame -> position part 0 (never the raw
+ * Write one hand's 65-value block into `target` at `offset`. Port of
+ * src/utils.py::_hand_block. `handFlat` is a 63-value raw landmark array or
+ * null; `frame` is [cx, cy, scale] in width units or null (no body anchor);
+ * `aspect` un-stretches. The target block must already be zeroed: missing hand
+ * -> zeros stay; no body frame -> position part stays 0 (never the raw
  * on-screen coordinate — that would leak absolute position).
  */
-function _handBlock(handFlat, frame, aspect) {
-  const out = new Float32Array(_HAND_BLOCK_LEN);
-  if (handFlat === null || handFlat === undefined) return out; // zeros = absent
-  out.set(normalizeLandmarks(handFlat, aspect), 0);            // 63 handshape
+function _handBlockInto(target, offset, handFlat, frame, aspect) {
+  if (handFlat === null || handFlat === undefined) return; // zeros = absent
+  normalizeLandmarks(handFlat, aspect, _handNormScratch);  // 63 handshape
+  for (let i = 0; i < 63; i++) target[offset + i] = _handNormScratch[i];
   if (frame !== null) {
     const [cx, cy, scale] = frame;
-    out[63] = (handFlat[0] - cx) / scale;             // raw wrist x
-    out[64] = (handFlat[1] / aspect - cy) / scale;    // raw wrist y (un-stretched)
+    target[offset + 63] = (handFlat[0] - cx) / scale;          // raw wrist x
+    target[offset + 64] = (handFlat[1] / aspect - cy) / scale; // raw wrist y (un-stretched)
   }
-  return out;
 }
 
 /**
  * Full (130,) body-anchored two-hand word feature for one frame.
  * Port of src/utils.py::build_word_features. `aspect` is MANDATORY (same as
  * Python) so a forgotten call site fails loudly instead of silently
- * reintroducing the per-axis geometry bug.
+ * reintroducing the per-axis geometry bug. `out` (optional) reuses a
+ * destination row — the live pipeline recycles rows through a pool; omitted,
+ * a fresh zeroed array is allocated (identical results either way).
  */
-export function buildWordFeatures(leftHand, rightHand, shoulderL, shoulderR, aspect) {
+export function buildWordFeatures(leftHand, rightHand, shoulderL, shoulderR, aspect, out) {
   if (aspect === undefined || aspect === null) {
     throw new Error("buildWordFeatures requires the frame aspect ratio (width/height).");
   }
@@ -175,10 +259,11 @@ export function buildWordFeatures(leftHand, rightHand, shoulderL, shoulderR, asp
     if (scale < 1e-6) scale = 1.0;
     frame = [cx, cy, scale];
   }
-  const out = new Float32Array(WORD_FEATURE_LEN);
-  out.set(_handBlock(leftHand, frame, aspect), 0);
-  out.set(_handBlock(rightHand, frame, aspect), _HAND_BLOCK_LEN);
-  return out;
+  const dst = out || new Float32Array(WORD_FEATURE_LEN);
+  if (out) dst.fill(0); // pooled rows carry old data; fresh arrays are zeroed
+  _handBlockInto(dst, 0, leftHand, frame, aspect);
+  _handBlockInto(dst, _HAND_BLOCK_LEN, rightHand, frame, aspect);
+  return dst;
 }
 
 /**
@@ -236,17 +321,19 @@ export function resampleSequence(frames, n) {
  * numpy default ddof=0). Used to decide whether the hand is actively signing.
  */
 export function sequenceMotion(frames, window) {
-  const recent = frames.slice(-window);
-  const T = recent.length;
+  // Index arithmetic instead of .slice(-window): same math, no per-call copy
+  // (this runs every frame in word mode).
+  const T = Math.min(window, frames.length);
   if (T === 0) return 0;
-  const D = recent[0].length;
+  const base = frames.length - T;
+  const D = frames[base].length;
   let total = 0;
   for (let d = 0; d < D; d++) {
     let mean = 0;
-    for (let t = 0; t < T; t++) mean += recent[t][d];
+    for (let t = 0; t < T; t++) mean += frames[base + t][d];
     mean /= T;
     let variance = 0;
-    for (let t = 0; t < T; t++) { const diff = recent[t][d] - mean; variance += diff * diff; }
+    for (let t = 0; t < T; t++) { const diff = frames[base + t][d] - mean; variance += diff * diff; }
     total += Math.sqrt(variance / T);
   }
   return total / D;
@@ -274,8 +361,9 @@ export function sequenceMotion(frames, window) {
  *
  * The smoother is deliberately NOT reset on commit: its votes for the incoming
  * sign keep accumulating, which is what lets the next distinct sign land fast.
- * Jitter protection therefore rests entirely on the smoother's minVotes rather
- * than on a dead time — raise WORD_SMOOTH_MIN_VOTES if spurious words appear.
+ * Jitter protection therefore rests entirely on the smoother's vote demand
+ * rather than on a dead time — raise WORD_SMOOTH_MIN_FRACTION if spurious
+ * words appear.
  */
 export class WordCommitFSM {
   constructor(smoother, cooldownSeconds) {
@@ -294,7 +382,9 @@ export class WordCommitFSM {
 
   /** @param wordPred {prediction,confidence}|null  @param now seconds */
   step(wordPred, now) {
-    this._smoother.update(wordPred ? wordPred.prediction : null);
+    // The FSM clock is in seconds (parity with main.py); the TimeSmoother
+    // takes milliseconds — the only line that bridges the two.
+    this._smoother.update(wordPred ? wordPred.prediction : null, now * 1000);
     const stable = this._smoother.getStable();
 
     if (stable !== null) {
@@ -323,30 +413,30 @@ export class WordCommitFSM {
 }
 
 /**
- * Running sentence of recognized signs. Port of src/overlay.py::WordBuffer:
- * each detected sign is appended; the sentence auto-clears after
- * sentencePauseFrames with no new sign (just pause to start fresh).
+ * Running sentence of recognized signs. Port of src/overlay.py::WordBuffer,
+ * time-based (web divergence, 2026-07-19): the sentence auto-clears after
+ * pauseMs with no new sign (just pause to start fresh) — a wall-clock pause,
+ * identical on every device regardless of fps.
  */
 export class WordBuffer {
-  constructor(sentencePauseFrames) {
+  constructor(pauseMs) {
     this._words = [];
-    this._idle = 0;
-    this._pause = sentencePauseFrames;
+    this._pause = pauseMs;
+    this._lastAddAt = 0;
   }
 
   /** Append a detected sign; returns it, or null for empty. */
-  add(word) {
+  add(word, nowMs) {
     if (!word) return null;
     this._words.push(word);
-    this._idle = 0;
+    this._lastAddAt = nowMs;
     return word;
   }
 
-  /** Advance the inactivity timer; auto-clear after the pause window. */
-  tick() {
+  /** Check the inactivity clock; auto-clear after the pause window. */
+  tick(nowMs) {
     if (this._words.length === 0) return;
-    this._idle++;
-    if (this._idle >= this._pause) this.clear();
+    if (nowMs - this._lastAddAt >= this._pause) this.clear();
   }
 
   getText() {
@@ -355,6 +445,6 @@ export class WordBuffer {
 
   clear() {
     this._words.length = 0;
-    this._idle = 0;
+    this._lastAddAt = 0;
   }
 }

@@ -30,8 +30,7 @@ export const MODES = {
     labelsUrl: "model/labels_one_hand.json",
     acceptThreshold: LETTER_CONFIDENCE_THRESHOLD,
     heading: "ASL letters, in your browser",
-    footer: "Static ASL letters A–Y (J and Z need motion — desktop version roadmap). "
-          + "Everything runs locally in your browser; no video leaves your device.",
+    footer: "Everything runs locally in your browser; no video leaves your device.",
   },
   numbers: {
     id: "numbers",
