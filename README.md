@@ -3,22 +3,25 @@
 Real-time American Sign Language (ASL) recognition from a camera. The app
 detects hand signs, turns them into on-screen text and speech, and lets the
 hearing side answer back — a two-way conversation tool for people who don't
-share a language. The goal is to remove the communication barrier between deaf
-and hearing people without either side needing to know sign language
-beforehand.
+share a language. Whole-word signs can also be translated into a fluent,
+correctly-conjugated sentence via an LLM. The goal is to remove the
+communication barrier between deaf and hearing people without either side
+needing to know sign language beforehand.
 
-It comes in two flavours, both running **100% locally** — no server, no
-account, and no video ever leaves the device:
+It ships as **two independent apps that share the same models and math**,
+both running **100% locally** — no server, no account, and no video ever
+leaves the device:
 
 - **Web app** (`web/`) — one page, no install, works on desktop and phone.
 - **Desktop app** (`main.py`) — Python/OpenCV, plus the capture and training
-  pipeline used to build the models.
+  pipeline used to build the models. Adds an LLM gloss→sentence translation
+  step and Whisper speech-to-text that aren't ported to the web app yet.
 
 Pre-trained models are included, so you can clone, install, and run. You can
 also capture your own signs and retrain everything to make it yours.
 
 > **Tech:** Python · MediaPipe · TensorFlow/Keras · OpenCV · scikit-learn ·
-> vanilla JavaScript (web)
+> vanilla JavaScript (web) · Claude API (translation) · Whisper (speech-to-text)
 
 ![Sign Language Translator detecting the letter A in real time](assets/screenshot.png)
 
@@ -33,11 +36,11 @@ The pipeline runs per camera frame:
 
 ```
 Camera frame
-  → MediaPipe detects the hand and extracts 21 landmarks (x, y, z) = 63 numbers
-  → normalize_landmarks (aspect-corrected + wrist-centered + scale-invariant)
-  → a neural network classifies the sign
+  → MediaPipe detects hands (+ shoulders, in words mode) and extracts landmarks
+  → normalize_landmarks (aspect-corrected, wrist-centered, scale-invariant)
+  → a neural network classifies the sign (dense net for letters/numbers, a TCN for words)
   → temporal smoothing removes single-frame flicker
-  → the stable prediction is drawn on screen, spoken, and logged
+  → the stable prediction is drawn on screen, spoken aloud, and logged
 ```
 
 The models learn the **geometry** of the hand (joint coordinates), not its
@@ -81,8 +84,9 @@ a fluent sentence with correct grammar and tense (*"Quiero tomar algo ahora."*).
 Conjugation and tense live in the translation layer, not the recognizer: ASL
 doesn't conjugate verbs, so teaching the recognizer conjugated forms would be
 both wrong and explosive. Press **T** in words mode to translate the signed
-sentence. It works offline too (falls back to the raw glosses), and it is
-currently a **desktop-only** feature.
+sentence. It works offline too (falls back to the raw glosses); this stage
+exists on desktop only for now — see the web roadmap in
+[web/README.md](web/README.md).
 
 ---
 
@@ -123,6 +127,8 @@ before deploying.
 
 ## Quick start — desktop app
 
+### Desktop (Python)
+
 You need **Python 3.10+** and a webcam.
 
 ```bash
@@ -142,6 +148,9 @@ pip install -r requirements.txt
 python main.py
 ```
 
+The pre-trained models are already in the repo, so the app runs right after
+installing — no dataset download or training required.
+
 ### Keyboard shortcuts
 
 | Key | Action |
@@ -155,8 +164,9 @@ python main.py
 | **P** | Toggle the speech-to-text microphone |
 
 The translation layer uses the Claude API. Set `ANTHROPIC_API_KEY` in your
-environment to enable it; without a key the app still runs and **T** just joins
-the recognized glosses. Tune it in [config.py](config.py) section 10.
+environment (see [.env.example](.env.example)) to enable it; without a key
+the app still runs and **T** just joins the recognized glosses. Tune it in
+[config.py](config.py) section 10.
 
 The starting mode is `MODE` in [config.py](config.py) (`"letters"`, `"numbers"`
 or `"words"`); L/N/W switch it live. On screen you get the detected sign, a
@@ -185,6 +195,8 @@ python capture/capture_words.py      # dynamic signs        -> .npy + manifest
 Edit the `LABELS` / `WORDS` list at the top of each script to choose what to
 capture. Letters and numbers save timestamped CSVs; word captures save one
 `.npy` sequence per take plus a `manifest.csv` under `data/real_capture/words/`.
+If a word capture session's manifest is ever lost or out of sync, rebuild it
+from the `.npy` files on disk with `python capture/rebuild_manifest.py`.
 
 All capture formats are **self-describing about camera geometry**: every sample
 records the frame's aspect ratio (an `aspect` column for letters/numbers, a
@@ -198,7 +210,10 @@ changes to normalization or sequence length never invalidate captured data.
 (different lighting, clothing, distance) — they *append*. A model trained on
 many takes from a single session memorizes that session and fails live; varied
 sessions are what make it generalize. This is the single most important factor
-for reliable recognition.
+for reliable recognition, and it's currently the biggest gap in the included
+letters dataset: its 9 CSVs each cover a different subset of letters from one
+capture window, so every letter class still has only one session's worth of
+data — unlike numbers and words below.
 
 ### 2. Train
 
@@ -225,7 +240,7 @@ ever split across train and test.
 
 ```bash
 python training/evaluate.py --cv 5           # words   (groups by session_id)
-python training/evaluate_letters.py --cv 5   # letters (groups by CSV file)
+python training/evaluate_letters.py --cv 5   # letters (groups by CSV file — needs 2+ sessions per letter to be meaningful)
 python training/evaluate_numbers.py --cv 5   # numbers (groups by CSV file)
 ```
 
@@ -245,8 +260,8 @@ python tools/update_web.py words
 ```
 
 Then open `web/js/utils.test.html` and confirm **all tests pass** before
-deploying. Skipping this leaves the deployed site silently serving the old
-model.
+deploying — this is a manual gate by design. Skipping this leaves the deployed
+site silently serving the old model.
 
 ---
 
@@ -256,12 +271,14 @@ model.
 Sign_Language_Translator/
 ├── main.py                  # Entry point — real-time desktop translator
 ├── config.py                # Single source of truth for all parameters
-├── requirements.txt         # Dependencies
+├── requirements.txt         # Python dependencies
+├── .env.example             # ANTHROPIC_API_KEY template
+├── netlify.toml             # Deploy config for the web app
 │
 ├── src/
 │   ├── detector.py          # Camera + MediaPipe hand/pose landmarks
 │   ├── classifier.py        # Loads the models and classifies in real time
-│   ├── utils.py             # normalize_landmarks + word features + smoothing
+│   ├── utils.py             # normalize_landmarks + build_word_features + resample_sequence
 │   ├── voice.py             # Speech synthesis (Windows SAPI5, offline)
 │   ├── overlay.py           # LetterBuffer + WordBuffer + SpeechBuffer (subtitles)
 │   ├── conversation_log.py  # Exportable conversation log (TXT + CSV)
@@ -269,9 +286,10 @@ Sign_Language_Translator/
 │   └── translator.py        # ASL glosses -> fluent sentence (Claude API, T key)
 │
 ├── capture/
-│   ├── capture_letters.py   # Static letter samples (CSV)
-│   ├── capture_numbers.py   # Static digit samples (CSV)
-│   └── capture_words.py     # Dynamic word sequences (.npy + manifest)
+│   ├── capture_letters.py    # Static letter samples (CSV)
+│   ├── capture_numbers.py    # Static digit samples (CSV)
+│   ├── capture_words.py      # Dynamic word sequences (.npy + manifest)
+│   └── rebuild_manifest.py   # Rebuilds words/manifest.csv from .npy files on disk
 │
 ├── training/
 │   ├── train_letters.py     # Letter model
@@ -281,12 +299,19 @@ Sign_Language_Translator/
 │   ├── eval_common.py       # Shared report + session-grouped CV
 │   └── evaluate*.py         # One evaluator per model
 │
-├── tools/                   # Web export: weights, fixtures, labels
-├── web/                     # Browser app (see web/README.md)
-├── docs/                    # IDEA.md (vision) · TECNICO.md · DESIGN_BRIEF.md
+├── tools/                   # export_model_json.py, make_fixtures.py, update_web.py
+│                             #   (bridge trained models -> web/)
 ├── model/                   # Trained models, labels, MediaPipe .task files
 ├── runs/                    # One JSON record per training run
-└── data/real_capture/       # letters/ + numbers/ (CSV) + words/ (.npy + manifest)
+├── data/real_capture/       # letters/ + numbers/ (CSV) + words/ (seq/*.npy + manifest.csv)
+├── docs/                    # Internal working docs (gitignored — not in the repo)
+│
+└── web/                     # Standalone browser app — see web/README.md
+    ├── index.html, css/
+    ├── js/                  # pipeline, model, utils, tts, stt, conversation, ui, config
+    ├── model/               # exported weights + labels + .task files
+    ├── fixtures/            # parity fixtures (desktop <-> web output must match)
+    └── vendor/              # MediaPipe WASM + fonts, vendored (no CDN)
 ```
 
 ---
@@ -298,13 +323,18 @@ Sign_Language_Translator/
 - Trained models (`model/*.h5`) and the MediaPipe `.task` detectors
 - Label maps (`model/labels_*.json`)
 - The captured datasets under `data/real_capture/`
-- The web app with its own copy of the models and a vendored MediaPipe runtime
+- The web app's own copy of the models (`web/model/`), parity fixtures
+  (`web/fixtures/`), and a vendored MediaPipe runtime
 
 **Not included (see [.gitignore](.gitignore)):**
 
 - The Python virtual environment (`venv/`) — recreate it with the steps above
 - Exported conversation logs (`logs/`) — per-session user data, not source
 - Secrets: `.env` is ignored; `.env.example` is the committable template
+- Internal working docs (`docs/`) — vision, technical reference, design brief;
+  kept local, not published
+- Large raw image datasets — the models are trained directly from captured
+  landmark CSVs/sequences, so no bulky image dataset is needed
 
 Everything required to run **and** to retrain is in the repository.
 
@@ -312,23 +342,30 @@ Everything required to run **and** to retrain is in the repository.
 
 ## Current status
 
-✅ **Working:**
+✅ **Implemented (desktop):**
 
-- Real-time hand and body detection (MediaPipe)
-- Letters A–Y (no J/Z), digits 0–9, and 18 dynamic word signs
+- Real-time hand + pose detection (MediaPipe)
+- Letters A–Y (no J/Z, 24 classes), digits 0–9, and 18 dynamic word signs + `nothing`
 - Confidence bar + top-3 alternatives when the model is unsure (< 70%)
-- Speech synthesis — desktop (SAPI5, offline) and web (Web Speech)
-- Speech-to-text — desktop (Whisper, push-to-talk) and web (dictation)
-- Accumulated subtitles and a two-way conversation log, exportable to TXT + CSV
-- Gloss → fluent sentence translation via the Claude API (desktop, **T**)
+- Speech synthesis (Windows SAPI5, offline) and speech-to-text (Whisper, push-to-talk)
+- Accumulated subtitles and a two-way conversation log, exportable to TXT + CSV (**E**)
+- Gloss → fluent sentence translation via the Claude API (**T**), offline fallback
 - Capture, training and session-grouped evaluation pipelines for all 3 models
-- Web app with all three modes, a conversation panel, and a parity test gate
+
+✅ **Implemented (web, see [web/README.md](web/README.md)):**
+
+- Same three modes (Letters / Numbers / Words), same models, running 100% client-side
+- Voice output (Web Speech synthesis) and dictation (Web Speech recognition)
+- Two-way conversation panel, REC + TXT/CSV export (byte-compatible with desktop logs)
+- Confidence bar, top-3 alternatives, camera picker, help/settings, `?debug` overlay
+- Netlify deploy config and a parity test gate (`web/js/utils.test.html`)
 
 🔜 **Next:**
 
-- Gloss → sentence translation in the web app
+- Gloss → sentence translation in the web app (currently desktop-only)
 - Dynamic J / Z letters (they need motion, so they belong to the word model)
 - A larger word vocabulary
+- A second capture session for letters, to make cross-session validation possible
 - Adding words from inside the app, without external scripts
 - Correction feedback to improve the model from real use
 
@@ -340,10 +377,17 @@ Everything required to run **and** to retrain is in the repository.
   flags them.
 - **The word vocabulary is small** (18 signs). More captured samples across more
   sessions is what makes it noticeably more reliable.
+- **Letters don't yet have cross-session diversity.** The 9 capture CSVs each
+  cover a different subset of letters from one recording window, so every
+  letter class still has only one session's worth of data — unlike numbers (4
+  sessions per digit) and words (11 sessions). A second full capture pass is
+  the fix.
 - **Validation accuracy is not live accuracy.** Use the session-grouped `--cv`
   evaluators for an honest number, and test with a person who wasn't recorded.
 - Recognition quality depends on lighting and camera position. In words mode the
   **shoulders must be visible** — the signs are anchored to the body.
+- Offline text-to-speech (SAPI5) is Windows-only on desktop; the web app uses
+  the browser's Web Speech API instead and works cross-platform.
 - On phones the web app runs at roughly 15–24 fps in words mode; that is the
   practical MediaPipe ceiling on mobile, not a bug.
 

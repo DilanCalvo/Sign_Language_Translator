@@ -31,6 +31,7 @@ logs/
 CLAUDE.md
 ROADMAP.md
 internal_project_documentation.txt
+docs/
 
 # Secrets — real API keys live in .env, which must NEVER be committed.
 # .env.example is the committable template (no real key in it).
