@@ -2,9 +2,12 @@
 
 > **Naturaleza de este documento.** Documento base (insumo) centrado
 > exclusivamente en lo técnico: tecnologías, lenguaje, arquitectura, modelos y
-> decisiones de ingeniería. Describe la **versión actual en Python** (lo que
-> existe y funciona) y, al final, la **visión técnica de la versión Web** futura.
-> Pensado para servir de fuente a documentos finales; por eso es exhaustivo.
+> decisiones de ingeniería. Describe la **aplicación de escritorio en Python**
+> (donde vive el pipeline de captura y entrenamiento) y, en la sección 15, la
+> **versión Web**, que hoy ya está construida y operativa. Pensado para servir
+> de fuente a documentos finales; por eso es exhaustivo.
+>
+> Última revisión de estado: 2026-07-19.
 
 ---
 
@@ -81,7 +84,8 @@ anteriores a ese cambio usan `LEGACY_CAPTURE_ASPECT` (16:9, la webcam original).
 > 2026-07-12. Los datos y el modelo anteriores a ese cambio eran features ya
 > procesados sin corrección posible; quedaron archivados en
 > `data/real_capture/words_legacy/` y `model/legacy/`, y el vocabulario se
-> recaptura con el formato nuevo: cada take guarda landmarks **crudos**
+> **recapturó completo** con el formato nuevo (11 sesiones, 668 takes): cada
+> take guarda landmarks **crudos**
 > (`(n_frames, 131)`: dos manos + hombros + aspecto por frame, layout en
 > `src/utils.py::pack_word_raw`), y la featurización + el resampleo a
 > `WORD_SEQ_LEN` ocurren al cargar (`train_words.py`) — así ningún cambio
@@ -107,7 +111,7 @@ que un frame ruidoso dispare una predicción falsa.
 
 ---
 
-## 5. Los dos modelos de reconocimiento
+## 5. Los tres modelos de reconocimiento
 
 El sistema entrena sus modelos **directamente con landmarks capturados por
 webcam** (datos propios), no con datasets externos.
@@ -115,6 +119,7 @@ webcam** (datos propios), no con datasets externos.
 | Modelo | Entrada | Detecta | Arquitectura | Archivo |
 |--------|---------|---------|--------------|---------|
 | **Letras** | 63 valores (1 frame, una mano) | Letras estáticas A–Y | Red densa (fully connected) | `model/model_one_hand.h5` |
+| **Números** | 63 valores (1 frame, una mano) | Dígitos 0–9 | Red densa (fully connected) | `model/model_numbers.h5` |
 | **Palabras** | Secuencia `(32, 130)` (2 manos, anclada al cuerpo) | Señas dinámicas / palabras | **TCN** temporal (Conv1D dilatadas) | `model/model_words.h5` |
 
 ### 5.1. Modelo de letras (estáticas)
@@ -124,6 +129,18 @@ webcam** (datos propios), no con datasets externos.
 - **Arquitectura densa:** la entrada es un único frame de coordenadas (no
   píxeles), por lo que una red totalmente conectada es la elección adecuada.
 - Etiquetas en `model/labels_one_hand.json`.
+- Entrenado con 3 750 muestras de 9 sesiones.
+
+### 5.1b. Modelo de números (estáticos)
+
+- **10 clases:** dígitos 0–9. Mismo formato de entrada, misma arquitectura y
+  mismo pipeline de captura que las letras (`capture_numbers.py`,
+  `train_numbers.py`); etiquetas en `model/labels_numbers.json`.
+- **Modelo separado de las letras a propósito:** varios dígitos ASL colisionan
+  con letras (2=V, 6=W, 9=F). En un único conjunto cerrado el clasificador
+  tendría que elegir entre dos respuestas igualmente correctas; separarlos deja
+  que el modo activo desambigüe.
+- Entrenado con 1 500 muestras de 4 sesiones.
 
 ### 5.2. Modelo de palabras (dinámicas) — TCN
 
@@ -346,17 +363,20 @@ archivos); una sola fuente de verdad para la normalización y las features.
 |------|--------|
 | Detección de manos (MediaPipe) | Completa |
 | Clasificación en tiempo real | Completa |
-| Modelo de letras (A–Y estáticas) | Entrenado y operativo |
-| Modelo de palabras (TCN) | Entrenado, operativo y validado — 92.9% val accuracy en entrenamiento (6 sesiones, 612 muestras); validación cruzada leak-free (`--cv 5`, 5-fold por sesión) confirma **94.1%** de generalización real entre sesiones |
-| Captura de palabras (multi-sesión) | Completa |
-| Entrenamiento de palabras (TCN) | Completo |
-| Traducción glosa→frase (LLM) | Completa (con fallback offline) |
+| Modelo de letras (A–Y estáticas) | Entrenado y operativo — 3 750 muestras / 9 sesiones, 98.9% val accuracy |
+| Modelo de números (0–9) | Entrenado y operativo — 1 500 muestras / 4 sesiones, 99.0% val accuracy |
+| Modelo de palabras (TCN) | Entrenado y operativo — vocabulario recapturado con corrección de aspecto: 18 glosas + `nothing`, 668 takes / 11 sesiones, 98.0% val accuracy |
+| Captura (letras, números, palabras) | Completa y multi-sesión |
+| Entrenamiento (los 3 modelos) | Completo, con registro por run en `runs/` |
+| Evaluación leak-free (`--cv`, agrupada por sesión) | Herramienta completa para los 3 modelos; **pendiente re-correrla** sobre el modelo de palabras recapturado |
+| Traducción glosa→frase (LLM) | Completa en escritorio (con fallback offline) |
 | Voz de salida (TTS) | Completa |
 | Speech-to-text (Whisper) | Completo |
 | Acumulación de letras + subtítulos | Completa |
 | Barra de confianza + top-3 alternativas | Completo |
 | Registro de conversación exportable | Completo |
-| Números 0–9 | Pipeline completo (`capture_numbers.py` + `train_numbers.py`, validado end-to-end); falta capturar con cámara y entrenar |
+| **Versión Web** | **Operativa** — los 3 modos, voz, conversación bidireccional, grabación/exportación (ver sección 15) |
+| Traducción glosa→frase en la Web | Pendiente (existe solo en escritorio) |
 | Letras J y Z (movimiento) | Pendiente (la interfaz las marca) |
 | Agregar palabras desde la app | Pendiente |
 
@@ -365,55 +385,84 @@ archivos); una sola fuente de verdad para la normalización y las features.
 ## 14. Limitaciones técnicas actuales
 
 - **J y Z** requieren movimiento; aún no se reconocen como poses estáticas.
-- **Vocabulario de palabras acotado:** 16 palabras + `nothing`. Más clases y
-  más muestras por seña mejoran la fiabilidad (todas las clases ya balanceadas
-  a 34 muestras, `nothing` a 68).
-- **Confusión en un cluster de señas y en la clase `nothing`:** la validación
-  cruzada leak-free (`training/evaluate.py --cv 5`, 2026-07-09) da 94.1% global
-  pero muestra dos puntos débiles persistentes: `nothing` tiene recall 0.76 (a
-  veces "dice" una palabra cuando no hay seña) y `need` se confunde con `want`
-  (`need` recall 0.82). Subir `WORD_CONFIDENCE_THRESHOLD` no lo corrige — el
-  barrido de umbral da accuracy parejo en todo el rango, así que es un problema
-  de datos/separabilidad, no de calibración. Fix probable: capturar más
-  muestras variadas de esas clases.
-- **Números (0–9):** infraestructura lista, falta capturar y entrenar el modelo.
+- **Vocabulario de palabras acotado:** 18 palabras + `nothing`. Más clases y
+  más muestras por seña mejoran la fiabilidad (clases balanceadas a 34 takes,
+  `nothing` a 68).
+- **El accuracy de validación no es el accuracy en vivo.** Los tres modelos
+  reportan >98% en holdout, pero ese número es optimista cuando las muestras de
+  validación salen de las mismas sesiones que las de entrenamiento. El número
+  honesto lo da la validación cruzada agrupada por sesión (`--cv`), que **está
+  pendiente de re-correr** sobre el modelo de palabras recapturado. El modelo
+  anterior (pre-recaptura) daba 94.1% leak-free frente a 92.9% de holdout, con
+  dos debilidades conocidas que conviene volver a verificar: `nothing` (recall
+  0.76 — a veces "dice" una palabra cuando no hay seña) y la confusión
+  `need`/`want`. En ese modelo, subir `WORD_CONFIDENCE_THRESHOLD` no lo
+  corregía: el barrido de umbral daba accuracy parejo en todo el rango, así que
+  era un problema de datos/separabilidad, no de calibración.
 - **Calidad dependiente del entorno:** iluminación y posición de cámara influyen;
-  capturar muestras propias en el setup habitual mejora la precisión.
+  capturar muestras propias en el setup habitual mejora la precisión. En modo
+  palabras los **hombros deben ser visibles** (las señas se anclan al cuerpo).
 - **Plataforma de voz:** la síntesis offline (SAPI5) es específica de Windows.
+  La versión web no tiene esa limitación (usa las voces del sistema vía Web
+  Speech), pero depende de qué voces tenga instaladas el dispositivo.
+- **Rendimiento en móvil (web):** ~15–24 fps en modo palabras. Es el techo
+  práctico de MediaPipe en teléfono, no un defecto corregible desde la app.
 
 ---
 
-## 15. Visión técnica de la versión Web (futuro)
+## 15. Versión Web (construida y operativa)
 
-La versión actual (Python, escritorio) se diseñó deliberadamente para **facilitar
-la migración a la web**. La versión Web es la evolución planteada como producto
-final: **alojada en un servidor y accesible desde el navegador**.
+Lo que en su momento fue el plan de migración **ya está implementado** en
+`web/`: una sola página, **sin backend, sin build step y sin framework**, que
+corre los tres modos (Letters / Numbers / Words) enteramente en el navegador,
+en escritorio y en teléfono. La documentación detallada vive en
+[`web/README.md`](../web/README.md).
 
-Ruta técnica prevista:
+Cómo se resolvió cada punto del plan original:
 
-- **TensorFlow.js:** los modelos Keras se convierten a TF.js **sin reentrenar**.
-  Por esto se eligió Keras y un TCN (las redes recurrentes habrían dado fricción
-  al portar).
-- **MediaPipe.js:** la detección de manos y pose tiene versión JavaScript, de modo
-  que el mismo extractor de landmarks corre en el navegador.
-- **Reimplementación idéntica de la normalización en JS:** `normalize_landmarks` y
-  el armado de features deben replicarse exactamente en JavaScript para que las
-  entradas coincidan con las del entrenamiento.
-- **Web Speech API:** para voz de entrada/salida en el navegador (sustituyendo
-  SAPI5 y Whisper local, que son dependencias de escritorio).
-- **Alojamiento en servidor:** la app deja de instalarse; se sirve por la web,
-  pudiendo correr la inferencia en el cliente (navegador) y/o apoyarse en
-  servidor según convenga.
-- **Mejor interfaz y funcionalidades específicas de web:** UI cuidada, uso desde
-  móvil y posibles funciones nuevas que el entorno web habilita.
+- **Inferencia en el navegador — sin TensorFlow.js.** El plan era convertir los
+  `.h5` a TF.js, pero **su conversor no instala en Windows**. La solución fue
+  exportar los pesos a JSON (`tools/export_model_json.py`) e implementar los
+  forward passes a mano en JavaScript: `DenseModel` (Dense + BatchNorm, para
+  letras y números) y `TCNModel` (Conv1D causal-dilatada + GlobalAvgPool +
+  Dense, para palabras). Menos dependencias y control total del costo por
+  frame; el precio es mantener esas implementaciones a mano.
+- **MediaPipe.js:** se usa `@mediapipe/tasks-vision`, **vendorizado localmente y
+  con versión fijada** (nunca desde CDN): un detector de otra versión podría
+  producir landmarks sutilmente distintos a los de los datos de entrenamiento.
+  La pose (ancla de cuerpo) se crea de forma perezosa, solo al entrar a modo
+  palabras.
+- **Normalización idéntica en JS:** `normalizeLandmarks` y `buildWordFeatures`
+  están reimplementados en `web/js/utils.js` y **verificados por un banco de
+  pruebas** (`web/js/utils.test.html`) que reproduce fixtures generados desde
+  datos reales de captura. Es la única garantía de que web y escritorio ven lo
+  mismo; correrlo es obligatorio antes de desplegar.
+- **Voz:** salida por **Web Speech** (con selector de voces del dispositivo) y
+  dictado del oyente por `SpeechRecognition` donde exista — sustituyen a SAPI5
+  y a Whisper local, que son dependencias de escritorio.
+- **Alojamiento:** despliegue estático (Netlify, ya configurado en
+  `netlify.toml`). **La inferencia es 100% del lado del cliente**: el video
+  nunca sale del dispositivo, lo que además resuelve la privacidad por diseño.
+- **Funciones propias de la web:** panel de conversación bidireccional (el
+  oyente escribe o dicta y su mensaje aparece en grande sobre la cámara),
+  grabación y exportación del transcript en TXT/CSV **byte-compatible con los
+  archivos del escritorio**, diálogos de ayuda y ajustes, selector de cámara.
 
-En síntesis: el prototipo Python **valida la viabilidad técnica**; la versión Web
-**la lleva a producción accesible**, reutilizando los modelos y la lógica de
-normalización ya validados.
+**Divergencia deliberada respecto de `config.py`:** el escritorio cuenta
+*frames* para las ventanas de suavizado porque su cámara corre a tasa fija; la
+web va de ~15 a 60 fps según el dispositivo, así que allí los mismos umbrales
+se expresan en **milisegundos** (cada valor equivale a su gemelo de `config.py`
+a 30 fps). Sin esa divergencia, en un teléfono había que sostener cada seña
+casi el triple de tiempo real.
+
+**Lo que falta en la web:** la traducción glosa → frase con LLM (sección 6),
+que hoy existe solo en la app de escritorio.
 
 ---
 
-## 16. Requisitos y ejecución (versión actual)
+## 16. Requisitos y ejecución
+
+### App de escritorio (Python)
 
 - **Requisitos:** Python 3.10+ y una webcam.
 - **Instalación:** entorno virtual + `pip install -r requirements.txt`.
@@ -421,3 +470,18 @@ normalización ya validados.
   que la app corre sin descargar datasets ni entrenar.
 - **Opcional:** definir `ANTHROPIC_API_KEY` para habilitar la traducción a frase
   natural (sin ella, la app funciona y solo une las glosas).
+
+### App web
+
+- **Requisitos:** un navegador reciente (Chrome, Edge o Safari) con cámara. No
+  hay instalación ni dependencias que compilar.
+- **Ejecución local:** `cd web && python -m http.server 8000`, luego abrir
+  `http://localhost:8000`. La cámara funciona en `localhost` por la excepción
+  de contexto seguro; en cualquier otro host exige HTTPS.
+- **Banco de pruebas:** `http://localhost:8000/js/utils.test.html` debe estar
+  todo en verde antes de desplegar.
+- **Despliegue:** estático. `netlify.toml` (raíz del repo) ya publica `web/` en
+  cada push.
+- **Tras reentrenar un modelo:** `python tools/update_web.py <letters|numbers|words>`
+  regenera pesos, fixtures y etiquetas para la web. Omitir este paso deja el
+  sitio sirviendo el modelo viejo en silencio.
